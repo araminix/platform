@@ -1,4 +1,4 @@
-import { deal, Err, err, Ok, ok, once, R, Result, Socket, StreamCloseCodes, t, uuid } from '@araminix/lib';
+import { deal, Err, err, logger, Ok, ok, once, R, Result, Socket, StreamCloseCodes, t, uuid } from '@araminix/lib';
 import { MessageChannel, Worker } from 'worker_threads';
 
 import AgentController from '../agent/AgentController.js';
@@ -74,14 +74,30 @@ export default class Instance {
         }
         this.userSocket = socket;
         once(async () => {
-            this.processStream(socket, 'load', () => this.load()).then();
-            this.processStream(socket, 'reload', (args) => this.reload(args)).then();
-            this.processStream(socket, 'prev', (args) => this.prev(args)).then();
-            this.processStream(socket, 'close', (args) => this.close(args)).then();
-            this.processStream(socket, 'switch', (args) => this.switchActive(args)).then();
-            this.processStream(socket, 'action', (args) => this.action(args)).then();
-            this.processStream(socket, 'query', (args) => this.query(args)).then();
-            this.processStream(socket, 'refresh', (args) => this.refresh(args)).then();
+            this.processStream(socket, 'load', () => this.load()).catch((err) => {
+                logger.error('Unhandled error in processStream load:', err);
+            });
+            this.processStream(socket, 'reload', (args) => this.reload(args)).catch((err) => {
+                logger.error('Unhandled error in processStream reload:', err);
+            });
+            this.processStream(socket, 'prev', (args) => this.prev(args)).catch((err) => {
+                logger.error('Unhandled error in processStream prev:', err);
+            });
+            this.processStream(socket, 'close', (args) => this.close(args)).catch((err) => {
+                logger.error('Unhandled error in processStream close:', err);
+            });
+            this.processStream(socket, 'switch', (args) => this.switchActive(args)).catch((err) => {
+                logger.error('Unhandled error in processStream switch:', err);
+            });
+            this.processStream(socket, 'action', (args) => this.action(args)).catch((err) => {
+                logger.error('Unhandled error in processStream action:', err);
+            });
+            this.processStream(socket, 'query', (args) => this.query(args)).catch((err) => {
+                logger.error('Unhandled error in processStream query:', err);
+            });
+            this.processStream(socket, 'refresh', (args) => this.refresh(args)).catch((err) => {
+                logger.error('Unhandled error in processStream refresh:', err);
+            });
             await socket.waitClose();
             if (this.userSocket === socket) {
                 this.userSocket = undefined;
@@ -191,9 +207,16 @@ export default class Instance {
                 return;
             }
             const stream = streamResult.unwrap();
-            const result = await handler(stream.args);
-            await stream.write((result as any).serialize());
-            stream.closeOk();
+            try {
+                const result = await handler(stream.args);
+                await stream.write((result as any).serialize());
+                stream.closeOk();
+            } catch (err) {
+                logger.error(`Error processing stream '${streamName}':`, err);
+                try {
+                    stream.closeErr();
+                } catch {}
+            }
         }
     }
 

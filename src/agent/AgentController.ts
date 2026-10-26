@@ -1,4 +1,4 @@
-import { CloseCodes, deal, Err, err, loop, LoopResult, Ok, ok, once, R, Result, Socket, t } from '@araminix/lib';
+import { CloseCodes, deal, Err, err, logger, loop, LoopResult, Ok, ok, once, R, Result, Socket, t } from '@araminix/lib';
 import { MessageChannel, MessagePort, Worker } from 'worker_threads';
 
 import { AcquireAgent, AgentList, AgentPost, AgentTask, Data, deserialize } from '../executor/proto.js';
@@ -156,25 +156,34 @@ class AgentInstance {
                 return LoopResult.Stop;
             }
             const stream = streamResult.unwrap();
-            const name = stream.args.name;
-            const data = stream.args.data;
-            if (typeof name !== 'string') {
-                stream.closeErr();
+            try {
+                const args = stream.args as { name?: unknown; data?: unknown } | null;
+                if (!args || typeof args !== 'object' || typeof args.name !== 'string') {
+                    stream.closeErr();
+                    return LoopResult.Cont;
+                }
+                const name = args.name;
+                const data = args.data;
+                const request = await this.requestSocket.writeRead(new AgentPost(name, data));
+                if (request.isErr()) {
+                    stream.closeErr();
+                    return LoopResult.Cont;
+                }
+                const response = request.unwrap();
+                if (!(response instanceof Data)) {
+                    stream.closeErr();
+                    return LoopResult.Cont;
+                }
+                await stream.write(response.data);
+                stream.closeOk();
+                return LoopResult.Cont;
+            } catch (err) {
+                logger.error('Unhandled error in AgentController post stream:', err);
+                try {
+                    stream.closeErr();
+                } catch {}
                 return LoopResult.Cont;
             }
-            const request = await this.requestSocket.writeRead(new AgentPost(name, data));
-            if (request.isErr()) {
-                stream.closeErr();
-                return LoopResult.Cont;
-            }
-            const response = request.unwrap();
-            if (!(response instanceof Data)) {
-                stream.closeErr();
-                return LoopResult.Cont;
-            }
-            await stream.write(response.data);
-            stream.closeOk();
-            return LoopResult.Cont;
         });
     }
 

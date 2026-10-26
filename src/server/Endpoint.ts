@@ -134,49 +134,77 @@ export default class Endpoint {
 
     private initWs(): void {
         this.express.ws(`${this.mount}/ws-token/:token/:endpoint/:arg`, async (ws, req: any) => {
-            const token = String(req.params.token);
-            const endpointName = String(req.params.endpoint);
-            const arg = String(req.params.arg ?? '');
-            const result = await this.authProvider.getInfo(token);
-            if (result.isErr()) {
-                ws.close(WsCloseCodes.Unauthorized);
-                return;
+            try {
+                const token = String(req.params.token);
+                const endpointName = String(req.params.endpoint);
+                const arg = String(req.params.arg ?? '');
+                const result = await this.authProvider.getInfo(token);
+                if (result.isErr()) {
+                    ws.close(WsCloseCodes.Unauthorized);
+                    return;
+                }
+                const clientInfo = result.unwrap();
+                await this.handle(token, clientInfo, endpointName, arg, ws);
+            } catch (err) {
+                logger.error('Unhandled rejection in /ws-token/:token/:endpoint/:arg:', err);
+                try {
+                    ws.close(WsCloseCodes.InternalError);
+                } catch {}
             }
-            const clientInfo = result.unwrap();
-            await this.handle(token, clientInfo, endpointName, arg, ws);
         });
 
         this.express.ws(`${this.mount}/ws-token/:token/:endpoint`, async (ws, req: any) => {
-            const token = String(req.params.token);
-            const endpointName = String(req.params.endpoint);
-            const arg = '';
-            const result = await this.authProvider.getInfo(token);
-            if (result.isErr()) {
-                ws.close(WsCloseCodes.Unauthorized);
-                return;
+            try {
+                const token = String(req.params.token);
+                const endpointName = String(req.params.endpoint);
+                const arg = '';
+                const result = await this.authProvider.getInfo(token);
+                if (result.isErr()) {
+                    ws.close(WsCloseCodes.Unauthorized);
+                    return;
+                }
+                const info = result.unwrap();
+                await this.handle(token, info, endpointName, arg, ws);
+            } catch (err) {
+                logger.error('Unhandled rejection in /ws-token/:token/:endpoint:', err);
+                try {
+                    ws.close(WsCloseCodes.InternalError);
+                } catch {}
             }
-            const info = result.unwrap();
-            await this.handle(token, info, endpointName, arg, ws);
         });
 
         this.express.ws(`${this.mount}/ws/:endpoint/:arg`, async (ws, req: CustomRequest) => {
-            if (!req.info || !req.token) {
-                ws.close(WsCloseCodes.Unauthorized);
-                return;
+            try {
+                if (!req.info || !req.token) {
+                    ws.close(WsCloseCodes.Unauthorized);
+                    return;
+                }
+                const arg = String(req.params.arg ?? '');
+                const endpointName = String(req.params.endpoint);
+                await this.handle(req.token, req.info, endpointName, arg, ws);
+            } catch (err) {
+                logger.error('Unhandled rejection in /ws/:endpoint/:arg:', err);
+                try {
+                    ws.close(WsCloseCodes.InternalError);
+                } catch {}
             }
-            const arg = String(req.params.arg ?? '');
-            const endpointName = String(req.params.endpoint);
-            await this.handle(req.token, req.info, endpointName, arg, ws);
         });
 
         this.express.ws(`${this.mount}/ws/:endpoint`, async (ws, req: CustomRequest) => {
-            if (!req.info || !req.token) {
-                ws.close(WsCloseCodes.Unauthorized);
-                return;
+            try {
+                if (!req.info || !req.token) {
+                    ws.close(WsCloseCodes.Unauthorized);
+                    return;
+                }
+                const arg = '';
+                const endpointName = String(req.params.endpoint);
+                await this.handle(req.token, req.info, endpointName, arg, ws);
+            } catch (err) {
+                logger.error('Unhandled rejection in /ws/:endpoint:', err);
+                try {
+                    ws.close(WsCloseCodes.InternalError);
+                } catch {}
             }
-            const arg = '';
-            const endpointName = String(req.params.endpoint);
-            await this.handle(req.token, req.info, endpointName, arg, ws);
         });
     }
 
@@ -304,8 +332,22 @@ export default class Endpoint {
                 if (err) {
                     res.status(404).end();
                 } else {
-                    const info = JSON.parse(data.toString());
-                    res.redirect(302, `${req.baseUrl}${req.path}/${info.name}`);
+                    try {
+                        const info = JSON.parse(data.toString());
+                        if (!info || typeof info.name !== 'string') {
+                            res.status(404).end();
+                            return;
+                        }
+                        const safeName = encodeURIComponent(path.basename(info.name));
+                        if (!safeName) {
+                            res.status(404).end();
+                            return;
+                        }
+                        res.redirect(302, `${req.baseUrl}${req.path}/${safeName}`);
+                    } catch (parseErr) {
+                        logger.error('Corrupt index.json for fileId:', fileId, parseErr);
+                        res.status(404).end();
+                    }
                 }
             });
         });

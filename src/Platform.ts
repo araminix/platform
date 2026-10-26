@@ -1,4 +1,4 @@
-import { Err, loop, LoopResult, Ok, Result, Socket, Stream, t } from '@araminix/lib';
+import { Err, logger, loop, LoopResult, Ok, Result, Socket, Stream, t } from '@araminix/lib';
 
 import AgentController from './agent/AgentController.js';
 import Instance from './executor/Instance.js';
@@ -81,7 +81,9 @@ export default class Platform {
                 request.deny();
                 return LoopResult.Cont;
             }
-            this.serveInstance((request.info as any).runtimeId, request).then();
+            this.serveInstance((request.info as any).runtimeId, request).catch((err) => {
+                logger.error('Unhandled rejection in serveInstance:', err);
+            });
             return LoopResult.Cont;
         });
 
@@ -93,7 +95,9 @@ export default class Platform {
                 request.deny();
                 return LoopResult.Cont;
             }
-            this.agentController.connect(request.info as any, request).then();
+            this.agentController.connect(request.info as any, request).catch((err) => {
+                logger.error('Unhandled rejection in agentController.connect:', err);
+            });
             return LoopResult.Cont;
         });
     }
@@ -105,24 +109,32 @@ export default class Platform {
                 return LoopResult.Stop;
             }
             const stream = streamResult.unwrap();
-            if (typeof stream.args !== 'string') {
-                stream.closeErr();
-                return LoopResult.Cont;
-            }
-            const instanceId = stream.args;
-            const userInstances = this.instances.get(runtimeId);
-            if (!userInstances) {
+            try {
+                if (typeof stream.args !== 'string') {
+                    stream.closeErr();
+                    return LoopResult.Cont;
+                }
+                const instanceId = stream.args;
+                const userInstances = this.instances.get(runtimeId);
+                if (!userInstances) {
+                    stream.closeOk();
+                    return LoopResult.Cont;
+                }
+                const instance = userInstances.get(instanceId);
+                if (!instance) {
+                    stream.closeOk();
+                    return LoopResult.Cont;
+                }
+                instance.destroy();
                 stream.closeOk();
                 return LoopResult.Cont;
-            }
-            const instance = userInstances.get(instanceId);
-            if (!instance) {
-                stream.closeOk();
+            } catch (err) {
+                logger.error('Error processing closeInstance stream:', err);
+                try {
+                    stream.closeErr();
+                } catch {}
                 return LoopResult.Cont;
             }
-            instance.destroy();
-            stream.closeOk();
-            return LoopResult.Cont;
         });
     }
 
@@ -135,7 +147,15 @@ export default class Platform {
                 if (streamResult.isErr()) {
                     return LoopResult.Stop;
                 }
-                await handler(clientInfo, streamResult.unwrap());
+                const stream = streamResult.unwrap();
+                try {
+                    await handler(clientInfo, stream);
+                } catch (err) {
+                    logger.error(`Error processing custom stream '${streamName}':`, err);
+                    try {
+                        stream.closeErr();
+                    } catch {}
+                }
                 return LoopResult.Cont;
             });
         }
@@ -148,11 +168,18 @@ export default class Platform {
                 return LoopResult.Stop;
             }
             const stream = streamResult.unwrap();
-            const result = await stream.write(clientInfo);
-            if (result.isErr()) {
-                stream.closeErr();
-            } else {
-                stream.closeOk();
+            try {
+                const result = await stream.write(clientInfo);
+                if (result.isErr()) {
+                    stream.closeErr();
+                } else {
+                    stream.closeOk();
+                }
+            } catch (err) {
+                logger.error('Error processing clientInfo stream:', err);
+                try {
+                    stream.closeErr();
+                } catch {}
             }
             return LoopResult.Cont;
         });
@@ -188,9 +215,16 @@ export default class Platform {
                 return LoopResult.Stop;
             }
             const stream = streamResult.unwrap();
-            const list = await this.listUserInstances(runtimeId);
-            await stream.write(list);
-            stream.closeOk();
+            try {
+                const list = await this.listUserInstances(runtimeId);
+                await stream.write(list);
+                stream.closeOk();
+            } catch (err) {
+                logger.error('Error processing listInstances stream:', err);
+                try {
+                    stream.closeErr();
+                } catch {}
+            }
             return LoopResult.Cont;
         });
     }
@@ -206,54 +240,81 @@ export default class Platform {
                 return LoopResult.Stop;
             }
             const stream = streamResult.unwrap();
-            if (!startInstanceArg.is(stream.args)) {
-                stream.closeErr();
-                return LoopResult.Cont;
-            }
-            const appName = stream.args.appName;
-            const profile = stream.args.profile;
-            const userApps = await this.appIndex.userApps(userId);
-            if (userApps.isErr()) {
-                stream.closeErr();
-                return LoopResult.Cont;
-            }
-            const appSearch = userApps.unwrap().find((listing) => {
-                const app = listing.apps.find((a) => a.name === appName && a.profiles.includes(profile));
-                return app !== undefined;
-            });
-            if (appSearch === undefined) {
-                stream.closeErr();
-                return LoopResult.Cont;
-            }
-            const instance = new Instance(userId, appName, profile, this.config.appIndexPath, this.config.tabLimit ?? 12, this.agentController);
-            if (!this.instances.has(runtimeId)) {
-                this.instances.set(runtimeId, new Map());
-            }
-            const instances = this.instances.get(runtimeId)!;
-            if (instances.size === this.config.instanceUserLimit) {
-                const first = instances.entries().next().value;
-                first?.[1].destroy();
-            }
-            instances.set(instance.id, instance);
-            const instanceInitResult = await instance.init(() => {
-                const insts = this.instances.get(runtimeId);
-                if (insts) {
-                    insts.delete(instance.id);
-                    if (insts.size === 0) {
+            let createdInstance: Instance | undefined;
+            try {
+                if (!startInstanceArg.is(stream.args)) {
+                    stream.closeErr();
+                    return LoopResult.Cont;
+                }
+                const appName = stream.args.appName;
+                const profile = stream.args.profile;
+                const userApps = await this.appIndex.userApps(userId);
+                if (userApps.isErr()) {
+                    stream.closeErr();
+                    return LoopResult.Cont;
+                }
+                const appSearch = userApps.unwrap().find((listing) => {
+                    const app = listing.apps.find((a) => a.name === appName && a.profiles.includes(profile));
+                    return app !== undefined;
+                });
+                if (appSearch === undefined) {
+                    stream.closeErr();
+                    return LoopResult.Cont;
+                }
+                const instance = new Instance(userId, appName, profile, this.config.appIndexPath, this.config.tabLimit ?? 12, this.agentController);
+                createdInstance = instance;
+                if (!this.instances.has(runtimeId)) {
+                    this.instances.set(runtimeId, new Map());
+                }
+                const instances = this.instances.get(runtimeId)!;
+                if (instances.size === this.config.instanceUserLimit) {
+                    const first = instances.entries().next().value;
+                    first?.[1].destroy();
+                }
+                instances.set(instance.id, instance);
+                const instanceInitResult = await instance.init(() => {
+                    const insts = this.instances.get(runtimeId);
+                    if (insts) {
+                        insts.delete(instance.id);
+                        if (insts.size === 0) {
+                            this.instances.delete(runtimeId);
+                        }
+                    }
+                });
+                if (instanceInitResult.isErr()) {
+                    instances.delete(instance.id);
+                    if (instances.size === 0) {
                         this.instances.delete(runtimeId);
                     }
+                    instance.destroy();
+                    stream.closeErr();
+                    return LoopResult.Cont;
                 }
-            });
-            if (instanceInitResult.isErr()) {
-                stream.closeErr();
+                const writeResult = await stream.write(instance.id);
+                if (writeResult.isErr()) {
+                    instance.destroy();
+                }
+                stream.closeOk();
+                return LoopResult.Cont;
+            } catch (err) {
+                logger.error('Error processing createInstance stream:', err);
+                if (createdInstance) {
+                    const insts = this.instances.get(runtimeId);
+                    if (insts) {
+                        insts.delete(createdInstance.id);
+                        if (insts.size === 0) {
+                            this.instances.delete(runtimeId);
+                        }
+                    }
+                    try {
+                        createdInstance.destroy();
+                    } catch {}
+                }
+                try {
+                    stream.closeErr();
+                } catch {}
                 return LoopResult.Cont;
             }
-            const writeResult = await stream.write(instance.id);
-            if (writeResult.isErr()) {
-                instance.destroy();
-            }
-            stream.closeOk();
-            return LoopResult.Cont;
         });
     }
 
@@ -264,13 +325,20 @@ export default class Platform {
                 return LoopResult.Stop;
             }
             const stream = streamResult.unwrap();
-            const userAppResult = await this.listUserApps(userId);
-            if (userAppResult.isErr()) {
-                stream.closeErr();
-                return LoopResult.Cont;
+            try {
+                const userAppResult = await this.listUserApps(userId);
+                if (userAppResult.isErr()) {
+                    stream.closeErr();
+                    return LoopResult.Cont;
+                }
+                await stream.write(userAppResult.unwrap());
+                stream.closeOk();
+            } catch (err) {
+                logger.error('Error processing listApps stream:', err);
+                try {
+                    stream.closeErr();
+                } catch {}
             }
-            await stream.write(userAppResult.unwrap());
-            stream.closeOk();
             return LoopResult.Cont;
         });
     }
