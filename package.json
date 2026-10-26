@@ -1,7 +1,7 @@
 {
     "name": "@araminix/platform",
     "description": "Enterprise-grade actor runtime, WebSocket endpoint platform, and agent execution engine",
-    "version": "1.0.1",
+    "version": "1.1.0",
     "main": "./dist/index.js",
     "types": "./dist/index.d.ts",
     "type": "module",
@@ -45,8 +45,8 @@
         "prepublishOnly": "pnpm run build && pnpm test",
         "format": "prettier --write .",
         "format:check": "prettier --check .",
-        "test": "node --test dist/tests/i18n.test.js dist/tests/actors.test.js dist/tests/builder.test.js dist/tests/workerSocket.test.js dist/tests/proto.test.js dist/tests/platform.test.js dist/tests/authProvider.test.js dist/tests/connectRequest.test.js dist/tests/endpointController.test.js dist/tests/minioService.test.js dist/tests/logMiddleware.test.js dist/tests/unhandledRejections.test.js",
-        "test:coverage": "node --experimental-test-coverage --test dist/tests/i18n.test.js dist/tests/actors.test.js dist/tests/builder.test.js dist/tests/workerSocket.test.js dist/tests/proto.test.js dist/tests/platform.test.js dist/tests/authProvider.test.js dist/tests/connectRequest.test.js dist/tests/endpointController.test.js dist/tests/minioService.test.js dist/tests/logMiddleware.test.js dist/tests/unhandledRejections.test.js"
+        "test": "node --test dist/tests/i18n.test.js dist/tests/actors.test.js dist/tests/builder.test.js dist/tests/workerSocket.test.js dist/tests/proto.test.js dist/tests/platform.test.js dist/tests/authProvider.test.js dist/tests/connectRequest.test.js dist/tests/endpointController.test.js dist/tests/minioService.test.js dist/tests/logMiddleware.test.js dist/tests/unhandledRejections.test.js dist/tests/endpointSecurity.test.js",
+        "test:coverage": "node --experimental-test-coverage --test dist/tests/i18n.test.js dist/tests/actors.test.js dist/tests/builder.test.js dist/tests/workerSocket.test.js dist/tests/proto.test.js dist/tests/platform.test.js dist/tests/authProvider.test.js dist/tests/connectRequest.test.js dist/tests/endpointController.test.js dist/tests/minioService.test.js dist/tests/logMiddleware.test.js dist/tests/unhandledRejections.test.js dist/tests/endpointSecurity.test.js"
     },
     "dependencies": {
         "@araminix/lib": "1.0.0",

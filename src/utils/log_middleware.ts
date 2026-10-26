@@ -24,8 +24,9 @@ class LogMiddleware extends Logger {
         return (req: Request, res: Response, next: NextFunction): void => {
             const { method, url } = req;
             res.once('finish', () => {
+                const sanitizedUrl = url.replace(/\/ws-token\/[^/?#]+/g, '/ws-token/[REDACTED]');
                 const duration = `${this.getDuration().toFixed(2)}ms`;
-                const log = `[${Logger.getTimestamp()}] ${method}: ${url} ${res.statusCode} ${duration}`;
+                const log = `[${Logger.getTimestamp()}] ${method}: ${sanitizedUrl} ${res.statusCode} ${duration}`;
                 this[this.statusLevel(res.statusCode)](log);
             });
             next();

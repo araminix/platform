@@ -1,7 +1,7 @@
 import { logger, Result, trimSlash, uuid, wrap, WsCloseCodes } from '@araminix/lib';
 import axios from 'axios';
 import cookieParser from 'cookie-parser';
-import expressCore, { NextFunction, Request, Response } from 'express';
+import expressCore, { CookieOptions, NextFunction, Request, Response } from 'express';
 import expressWs from 'express-ws';
 import fs from 'fs';
 import type { Server } from 'http';
@@ -32,6 +32,7 @@ export interface EndpointOptions {
     sessionTtl?: number;
     uploadDir?: string | void;
     minio?: MinioOptions | void;
+    cookieOptions?: CookieOptions;
 }
 
 function validateToken(req: CustomRequest, res: Response, next: NextFunction): void {
@@ -55,9 +56,9 @@ export default class Endpoint {
     private server?: Server;
     private readonly connections: Map<string, unknown> = new Map();
     private endpoints: Map<string, EndpointController> = new Map();
-    private COOKIE_OPTIONS: { signed: boolean; httpOnly: boolean; maxAge: number };
+    private COOKIE_OPTIONS: CookieOptions;
 
-    constructor({ authProvider, port = 3000, mount, version, cookieSecret = uuid(), sessionTtl = 3600 * 24, uploadDir, minio = undefined }: EndpointOptions) {
+    constructor({ authProvider, port = 3000, mount, version, cookieSecret = uuid(), sessionTtl = 3600 * 24, uploadDir, minio = undefined, cookieOptions }: EndpointOptions) {
         this.authProvider = authProvider;
         this.port = port;
         this.mount = mount ? `/${trimSlash(mount)}` : '';
@@ -66,7 +67,15 @@ export default class Endpoint {
         this.sessionTtl = sessionTtl;
         this.uploadDir = uploadDir;
         this.minio = minio;
-        this.COOKIE_OPTIONS = { signed: true, httpOnly: false, maxAge: this.sessionTtl * 1000 };
+        this.COOKIE_OPTIONS = {
+            signed: true,
+            httpOnly: true,
+            secure: true,
+            sameSite: 'lax',
+            path: '/',
+            maxAge: this.sessionTtl * 1000,
+            ...cookieOptions,
+        };
         this.express = expressWs(expressCore()).app;
         this.init();
     }
@@ -133,6 +142,9 @@ export default class Endpoint {
     }
 
     private initWs(): void {
+        /**
+         * @deprecated Use /ws/:endpoint/:arg with cookie or x-token header instead.
+         */
         this.express.ws(`${this.mount}/ws-token/:token/:endpoint/:arg`, async (ws, req: any) => {
             try {
                 const token = String(req.params.token);
@@ -153,6 +165,9 @@ export default class Endpoint {
             }
         });
 
+        /**
+         * @deprecated Use /ws/:endpoint with cookie or x-token header instead.
+         */
         this.express.ws(`${this.mount}/ws-token/:token/:endpoint`, async (ws, req: any) => {
             try {
                 const token = String(req.params.token);
@@ -280,7 +295,7 @@ export default class Endpoint {
                 await this.authProvider.destroy(req.token);
                 this.deauth(req.info, req.token);
             }
-            res.clearCookie('token').status(200).send({ success: true }).end();
+            res.clearCookie('token', this.COOKIE_OPTIONS).status(200).send({ success: true }).end();
         });
 
         this.express.put(`${this.mount}/auth/refresh`, async (req, res) => {

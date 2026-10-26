@@ -172,6 +172,33 @@ const dashboard = panel({ header: 'System Overview' })
 
 ---
 
+### 4. Session Security & Cookie Configuration
+
+`Endpoint` issues signed, hardened session cookies by default:
+
+- Default Flags: `HttpOnly: true`, `Secure: true`, `SameSite: 'lax'`, `Path: '/'`, and TTL-based `Max-Age`.
+- Customizable via optional `cookieOptions` in `EndpointOptions`:
+
+```typescript
+const endpoint = new Endpoint({
+    authProvider: new CustomAuthProvider(),
+    cookieOptions: {
+        secure: process.env.NODE_ENV === 'production',
+        sameSite: 'lax',
+    },
+});
+```
+
+#### WebSocket Authentication Routes
+
+- **`/ws/:endpoint` (Recommended):**
+    - **Browsers:** Cookie-authenticated via `httpOnly` session cookie automatically attached on WebSocket upgrade.
+    - **Node Clients / Agents:** Header-authenticated by passing `x-token: <token>` in the HTTP upgrade request headers.
+- **`/ws-token/:token/:endpoint` (`@deprecated`):**
+    - Maintained for backward compatibility with legacy clients. Tokens in URL paths are automatically redacted in server access logs.
+
+---
+
 ## 🛠️ Module Exports
 
 | Submodule            | Purpose                                                                                        |
