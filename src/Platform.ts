@@ -4,7 +4,7 @@ import AgentController from './agent/AgentController.js';
 import Instance from './executor/Instance.js';
 import { AppIndex, AppListing } from './lib/d.js';
 import { AuthProvider, ClientInfo, ClientType } from './server/AuthProvider.js';
-import Endpoint from './server/Endpoint.js';
+import Endpoint, { UploadAllowlist } from './server/Endpoint.js';
 
 export interface PlatformConfig {
     appIndexPath: URL;
@@ -16,6 +16,8 @@ export interface PlatformConfig {
     cookieSecret?: string;
     tabLimit?: number;
     uploadDir?: string;
+    maxUploadBytes?: number;
+    uploadAllowlist?: UploadAllowlist;
     onCustomStream?: {
         [key: string]: (client: ClientInfo, stream: Stream) => Promise<void>;
     };
@@ -45,6 +47,8 @@ export default class Platform {
             mount: config.mount,
             cookieSecret: config.cookieSecret,
             uploadDir: config.uploadDir,
+            maxUploadBytes: config.maxUploadBytes,
+            uploadAllowlist: config.uploadAllowlist,
         });
         this.agentController = new AgentController(this.config.agentIndexPath);
         this.serve();

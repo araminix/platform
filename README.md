@@ -2,7 +2,7 @@
 
 > **Enterprise-grade actor runtime, WebSocket endpoint platform, and multi-threaded agent execution engine.**
 
-[![npm version](https://img.shields.io/badge/version-1.0.0-blue.svg)](https://www.npmjs.com/package/@araminix/platform)
+[![npm version](https://img.shields.io/badge/version-1.2.0-blue.svg)](https://www.npmjs.com/package/@araminix/platform)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.4-blue.svg)](https://www.typescriptlang.org/)
 [![Node.js](https://img.shields.io/badge/Node.js-%3E%3D20.0.0-green.svg)](https://nodejs.org/)
@@ -196,6 +196,32 @@ const endpoint = new Endpoint({
     - **Node Clients / Agents:** Header-authenticated by passing `x-token: <token>` in the HTTP upgrade request headers.
 - **`/ws-token/:token/:endpoint` (`@deprecated`):**
     - Maintained for backward compatibility with legacy clients. Tokens in URL paths are automatically redacted in server access logs.
+
+---
+
+### 5. File Upload Security & Stored XSS Mitigation
+
+`Endpoint` and `Platform` provide hardened file upload and static download controls:
+
+- **Upload Size Limits:** Configured via `maxUploadBytes` (default: 20 MB). Oversized files are rejected with HTTP 413 (`Payload Too Large`). Only single-file uploads (`files: 1`) are permitted per request.
+- **Allowlist Filtering:** Optional `uploadAllowlist` restricts uploads to specific extensions and/or MIME types. Unauthorized uploads are rejected with HTTP 415 (`Unsupported Media Type`):
+    ```typescript
+    const platform = new Platform({
+        uploadDir: '/var/data/uploads',
+        maxUploadBytes: 10 * 1024 * 1024, // 10 MB
+        uploadAllowlist: {
+            extensions: ['png', 'jpg', 'pdf'],
+            mimetypes: ['image/png', 'image/jpeg', 'application/pdf'],
+        },
+        // ...
+    });
+    ```
+- **Filename Sanitization:** Uploaded filenames are stripped of path traversal sequences (`..`, `/`, `\`), null bytes, and non-printable control characters, with length capped at 255 characters.
+- **Stored XSS Defenses:** Static file downloads (`/file/:fileId/:safeName`) enforce defense-in-depth security headers:
+    - `X-Content-Type-Options: nosniff`
+    - `Content-Disposition: attachment` (forces browser download instead of inline execution)
+    - `Content-Security-Policy: default-src 'none'; sandbox` (strips script execution privileges and isolates origin)
+    - `dotfiles: 'deny'` and `index: false`
 
 ---
 

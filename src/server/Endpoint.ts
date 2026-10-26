@@ -23,6 +23,11 @@ export interface ServerDriver {
     getUserId: (token: string) => Promise<Result<string, unknown>>;
 }
 
+export interface UploadAllowlist {
+    extensions?: string[];
+    mimetypes?: string[];
+}
+
 export interface EndpointOptions {
     authProvider: AuthProvider;
     port?: number;
@@ -33,6 +38,8 @@ export interface EndpointOptions {
     uploadDir?: string | void;
     minio?: MinioOptions | void;
     cookieOptions?: CookieOptions;
+    maxUploadBytes?: number;
+    uploadAllowlist?: UploadAllowlist;
 }
 
 function validateToken(req: CustomRequest, res: Response, next: NextFunction): void {
@@ -52,13 +59,27 @@ export default class Endpoint {
     private sessionTtl: number;
     private uploadDir?: string | void;
     private minio?: MinioOptions | void;
+    private maxUploadBytes: number;
+    private uploadAllowlist?: UploadAllowlist;
     readonly express: expressWs.Application;
     private server?: Server;
     private readonly connections: Map<string, unknown> = new Map();
     private endpoints: Map<string, EndpointController> = new Map();
     private COOKIE_OPTIONS: CookieOptions;
 
-    constructor({ authProvider, port = 3000, mount, version, cookieSecret = uuid(), sessionTtl = 3600 * 24, uploadDir, minio = undefined, cookieOptions }: EndpointOptions) {
+    constructor({
+        authProvider,
+        port = 3000,
+        mount,
+        version,
+        cookieSecret = uuid(),
+        sessionTtl = 3600 * 24,
+        uploadDir,
+        minio = undefined,
+        cookieOptions,
+        maxUploadBytes = 20 * 1024 * 1024,
+        uploadAllowlist,
+    }: EndpointOptions) {
         this.authProvider = authProvider;
         this.port = port;
         this.mount = mount ? `/${trimSlash(mount)}` : '';
@@ -67,6 +88,8 @@ export default class Endpoint {
         this.sessionTtl = sessionTtl;
         this.uploadDir = uploadDir;
         this.minio = minio;
+        this.maxUploadBytes = maxUploadBytes;
+        this.uploadAllowlist = uploadAllowlist;
         this.COOKIE_OPTIONS = {
             signed: true,
             httpOnly: true,
@@ -310,7 +333,18 @@ export default class Endpoint {
         });
     }
 
+    private sanitizeFilename(originalName: string): string {
+        const base = path
+            .basename(originalName)
+            .replace(/[/\\]/g, '')
+            .replace(/[\x00-\x1f\x7f-\x9f]/g, '')
+            .trim();
+        const safe = base === '.' || base === '..' || base === '' ? 'upload' : base;
+        return safe.slice(0, 255);
+    }
+
     private initMulter(uploadDir: string): void {
+        const sanitize = (name: string) => this.sanitizeFilename(name);
         const storage = multer.diskStorage({
             destination: function (_req, file: any, cb) {
                 const id = uuid();
@@ -320,25 +354,95 @@ export default class Endpoint {
                 cb(null, dir);
             },
             filename: function (_req, file, cb) {
+                file.originalname = sanitize(file.originalname || '');
                 cb(null, file.originalname);
             },
         });
-        const upload = multer({ storage: storage });
 
-        this.express.post(`${this.mount}/file`, validateToken, upload.single('file'), (req: CustomRequest, res) => {
-            const { originalname, size, mimetype, id } = req.file;
-            const fileInfo = {
-                name: originalname,
-                size,
-                mimetype,
-                id,
-                userId: req.info?.id ?? '',
-            };
-            const infoPath = path.join(uploadDir, fileInfo.id, 'index.json');
-            fs.writeFile(infoPath, JSON.stringify(fileInfo), () => {
-                res.status(200).json(fileInfo).end();
-            });
+        const fileFilter: multer.Options['fileFilter'] = (_req, file, cb) => {
+            if (this.uploadAllowlist) {
+                const { extensions, mimetypes } = this.uploadAllowlist;
+                const safeName = sanitize(file.originalname || '');
+                const ext = path.extname(safeName).toLowerCase().replace(/^\./, '');
+                const mime = (file.mimetype || '').toLowerCase();
+
+                if (extensions && extensions.length > 0) {
+                    const normalizedExts = extensions.map((e) => e.toLowerCase().replace(/^\./, ''));
+                    if (!normalizedExts.includes(ext)) {
+                        const err = new Error('File extension not allowed');
+                        (err as any).statusCode = 415;
+                        cb(err);
+                        return;
+                    }
+                }
+
+                if (mimetypes && mimetypes.length > 0) {
+                    const normalizedMimes = mimetypes.map((m) => m.toLowerCase());
+                    if (!normalizedMimes.includes(mime)) {
+                        const err = new Error('MIME type not allowed');
+                        (err as any).statusCode = 415;
+                        cb(err);
+                        return;
+                    }
+                }
+            }
+            cb(null, true);
+        };
+
+        const upload = multer({
+            storage: storage,
+            limits: {
+                fileSize: this.maxUploadBytes,
+                files: 1,
+            },
+            fileFilter,
         });
+
+        this.express.post(
+            `${this.mount}/file`,
+            validateToken,
+            (req: CustomRequest, res: Response, next: NextFunction) => {
+                upload.single('file')(req, res, (err: any) => {
+                    if (err) {
+                        if (err instanceof multer.MulterError) {
+                            if (err.code === 'LIMIT_FILE_SIZE') {
+                                res.status(413).json({ error: `File exceeds maximum allowed size of ${this.maxUploadBytes} bytes` });
+                                return;
+                            }
+                            res.status(400).json({ error: err.message });
+                            return;
+                        }
+                        const status = err.statusCode || 400;
+                        res.status(status).json({ error: err.message || 'Upload error' });
+                        return;
+                    }
+                    if (!req.file) {
+                        res.status(400).json({ error: 'No file uploaded' });
+                        return;
+                    }
+                    next();
+                });
+            },
+            (req: CustomRequest, res) => {
+                const { originalname, size, mimetype, id } = req.file;
+                const fileInfo = {
+                    name: originalname,
+                    size,
+                    mimetype,
+                    id,
+                    userId: req.info?.id ?? '',
+                };
+                const infoPath = path.join(uploadDir, fileInfo.id, 'index.json');
+                fs.writeFile(infoPath, JSON.stringify(fileInfo), (err) => {
+                    if (err) {
+                        logger.error('Failed to write file metadata:', err);
+                        res.status(500).json({ error: 'Failed to save file metadata' }).end();
+                        return;
+                    }
+                    res.status(200).json(fileInfo).end();
+                });
+            },
+        );
 
         this.express.get(`${this.mount}/file/:fileId`, validateToken, (req, res) => {
             const fileId = String(req.params.fileId);
@@ -367,7 +471,19 @@ export default class Endpoint {
             });
         });
 
-        this.express.use(`${this.mount}/file/`, validateToken, expressCore.static(this.uploadDir!));
+        this.express.use(
+            `${this.mount}/file/`,
+            validateToken,
+            expressCore.static(this.uploadDir!, {
+                index: false,
+                dotfiles: 'deny',
+                setHeaders: (res) => {
+                    res.setHeader('X-Content-Type-Options', 'nosniff');
+                    res.setHeader('Content-Disposition', 'attachment');
+                    res.setHeader('Content-Security-Policy', "default-src 'none'; sandbox");
+                },
+            }),
+        );
     }
 
     private init2FA(): void {
