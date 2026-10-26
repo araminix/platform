@@ -1,0 +1,14 @@
+{
+    "semi": true,
+    "trailingComma": "all",
+    "singleQuote": true,
+    "printWidth": 180,
+    "tabWidth": 4,
+    "bracketSameLine": true,
+    "plugins": ["@trivago/prettier-plugin-sort-imports"],
+    "importOrder": ["^@folkrum/(.*)$", "^@core/(.*)$", "^@system/(.*)$", "^@apps/(.*)$", "^@models/(.*)$", "^(@helpers|@configs|@utils)/(.*)$", "^[./]"],
+    "importOrderSeparation": true,
+    "importOrderSortSpecifiers": true,
+    "importOrderCaseInsensitive": true,
+    "importOrderGroupNamespaceSpecifiers": true
+}
