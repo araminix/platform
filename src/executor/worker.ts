@@ -3,7 +3,7 @@ import { parentPort } from 'worker_threads';
 
 import { initAgentWorkerDriver } from '../agent/agentWorkerDriver.js';
 import { App } from '../lib/d.js';
-import { RequestSocket, ResponseSocket } from '../lib/worker_socket.js';
+import { Req, RequestSocket, ResponseSocket } from '../lib/worker_socket.js';
 import { AppInstance } from './AppInstance.js';
 import { Action, Close, Data, deserialize, Load, Other, Prev, Query, Refresh, Reload, Switch } from './proto.js';
 import { initWorkerDriver } from './workerDriver.js';
@@ -24,103 +24,109 @@ class Worker {
     }
 
     async run(): Promise<void> {
-        await this.app.init();
-        main: while (true) {
+        await this.app.exclusive(() => this.app.init());
+        while (true) {
             const result = await this.responseSocket.read();
             if (result.isErr()) {
                 break;
             }
             const request = result.unwrap();
+            if (request === undefined) {
+                break;
+            }
             try {
-                switch (true) {
-                    case request === undefined:
-                        break main;
-                    case request instanceof Reload: {
-                        const res = await this.app.reload();
-                        if (res?.isOk()) {
-                            this.responseSocket.resolve();
-                            break;
-                        }
-                        this.responseSocket.reject();
-                        break;
-                    }
-                    case request instanceof Switch: {
-                        const switchActive = request as Switch;
-                        const res = await this.app.switch(switchActive.activityId);
-                        if (res?.isOk()) {
-                            this.responseSocket.resolve();
-                            break;
-                        }
-                        this.responseSocket.reject();
-                        break;
-                    }
-                    case request instanceof Close: {
-                        const close = request as Close;
-                        const res = await this.app.userClose(close.activityId);
-                        if (res?.isOk()) {
-                            this.responseSocket.resolve();
-                            break;
-                        }
-                        this.responseSocket.reject();
-                        break;
-                    }
-                    case request instanceof Prev: {
-                        const prev = request as Prev;
-                        const res = await this.app.prev(prev.activityId);
-                        if (res?.isOk()) {
-                            this.responseSocket.resolve();
-                            break;
-                        }
-                        this.responseSocket.reject();
-                        break;
-                    }
-                    case request instanceof Load: {
-                        const res = await this.app.load();
-                        if (res?.isOk()) {
-                            this.responseSocket.resolve();
-                            break;
-                        }
-                        this.responseSocket.reject();
-                        break;
-                    }
-                    case request instanceof Refresh: {
-                        const refresh = request as Refresh;
-                        const res = await this.app.refresh(refresh.activityId);
-                        if (res?.isOk()) {
-                            this.responseSocket.resolve();
-                            break;
-                        }
-                        this.responseSocket.reject();
-                        break;
-                    }
-                    case request instanceof Action: {
-                        const action = request as Action;
-                        const res = await this.app.action(action.fragmentId, action.name, action.data);
-                        if (res?.isOk()) {
-                            this.responseSocket.resolve();
-                            break;
-                        }
-                        this.responseSocket.reject();
-                        break;
-                    }
-                    case request instanceof Query: {
-                        const query = request as Query;
-                        const res = await this.app.query(query.fragmentId, query.name, query.data);
-                        if (res?.isOk()) {
-                            this.responseSocket.resolve(new Data((res as any).v));
-                            break;
-                        }
-                        this.responseSocket.reject();
-                        break;
-                    }
-                    default:
-                        this.responseSocket.write(undefined);
-                }
+                // Requests share the app lock with trigger() calls from timers, so they never interleave.
+                await this.app.exclusive(() => this.handle(request));
             } catch (error) {
                 // An exception in app code fails this request only; the instance keeps serving.
                 logger.error(`App worker failed to handle ${request?._type}:`, error);
                 this.responseSocket.reject(new Other(error instanceof Error ? error.message : String(error)));
             }
+        }
+    }
+
+    private async handle(request: Req): Promise<void> {
+        switch (true) {
+            case request instanceof Reload: {
+                const res = await this.app.reload();
+                if (res?.isOk()) {
+                    this.responseSocket.resolve();
+                    break;
+                }
+                this.responseSocket.reject();
+                break;
+            }
+            case request instanceof Switch: {
+                const switchActive = request as Switch;
+                const res = await this.app.switch(switchActive.activityId);
+                if (res?.isOk()) {
+                    this.responseSocket.resolve();
+                    break;
+                }
+                this.responseSocket.reject();
+                break;
+            }
+            case request instanceof Close: {
+                const close = request as Close;
+                const res = await this.app.userClose(close.activityId);
+                if (res?.isOk()) {
+                    this.responseSocket.resolve();
+                    break;
+                }
+                this.responseSocket.reject();
+                break;
+            }
+            case request instanceof Prev: {
+                const prev = request as Prev;
+                const res = await this.app.prev(prev.activityId);
+                if (res?.isOk()) {
+                    this.responseSocket.resolve();
+                    break;
+                }
+                this.responseSocket.reject();
+                break;
+            }
+            case request instanceof Load: {
+                const res = await this.app.load();
+                if (res?.isOk()) {
+                    this.responseSocket.resolve();
+                    break;
+                }
+                this.responseSocket.reject();
+                break;
+            }
+            case request instanceof Refresh: {
+                const refresh = request as Refresh;
+                const res = await this.app.refresh(refresh.activityId);
+                if (res?.isOk()) {
+                    this.responseSocket.resolve();
+                    break;
+                }
+                this.responseSocket.reject();
+                break;
+            }
+            case request instanceof Action: {
+                const action = request as Action;
+                const res = await this.app.action(action.fragmentId, action.name, action.data);
+                if (res?.isOk()) {
+                    this.responseSocket.resolve();
+                    break;
+                }
+                this.responseSocket.reject();
+                break;
+            }
+            case request instanceof Query: {
+                const query = request as Query;
+                const res = await this.app.query(query.fragmentId, query.name, query.data);
+                if (res?.isOk()) {
+                    this.responseSocket.resolve(new Data((res as any).v));
+                    break;
+                }
+                this.responseSocket.reject();
+                break;
+            }
+            default:
+                this.responseSocket.write(undefined);
         }
     }
 }

@@ -1,4 +1,5 @@
 import { Defined, Err, ok, Result, uuid } from '@araminix/lib';
+import { AsyncLocalStorage } from 'node:async_hooks';
 
 import { BuildedPart } from '../builder/builder.js';
 import { Nothing, ReloadFragment, UpdateFragment, UpdateTypes } from '../lib/actors.js';
@@ -17,6 +18,37 @@ export enum AppError {
 
 export type AppResult = Result<void, AppError>;
 
+// Serialises everything that changes an app's activities: requests from the main thread and trigger() calls made
+// from timers or callbacks. Calls made while the lock is held (e.g. trigger() awaited inside an action) run directly.
+class ActivityLock {
+    private tail: Promise<void> = Promise.resolve();
+    private readonly holder: AsyncLocalStorage<{ held: boolean }> = new AsyncLocalStorage();
+
+    async run<T>(task: () => Promise<T>): Promise<T> {
+        if (this.holder.getStore()?.held) {
+            return task();
+        }
+        const previous = this.tail;
+        let release!: () => void;
+        this.tail = new Promise<void>((resolve) => {
+            release = resolve;
+        });
+        await previous;
+        // Timers created inside the task inherit this token; clearing `held` on release makes them queue like any other caller.
+        const token = { held: true };
+        try {
+            return await this.holder.run(token, task);
+        } finally {
+            token.held = false;
+            release();
+        }
+    }
+
+    outside<T>(callback: () => T): T {
+        return this.holder.exit(callback);
+    }
+}
+
 export class ActivityDriver {
     private appInstance: AppInstance;
     private activity: ActivityInstance;
@@ -25,6 +57,14 @@ export class ActivityDriver {
     constructor(appInstance: AppInstance, activity: ActivityInstance) {
         this.appInstance = appInstance;
         this.activity = activity;
+    }
+
+    exclusive<T>(task: () => Promise<T>): Promise<T> {
+        return this.appInstance.exclusive(task);
+    }
+
+    outsideLock<T>(callback: () => T): T {
+        return this.appInstance.outsideLock(callback);
     }
 
     private async executeIfActive<T>(runnable: () => Promise<Result<T, AppError>>): Promise<Result<T, AppError>> {
@@ -235,11 +275,22 @@ export class AppInstance {
     private readonly secondAction?: { name: string; ctx: Record<string, any> | null } | null;
     private index: ActivityInstance[] = [];
     private history: ActivityInstance[] = [];
+    private readonly lock: ActivityLock = new ActivityLock();
 
     constructor(appDeclaration: App<any, any>, tabLimit: number, secondAction: { name: string; ctx: Record<string, any> | null } | null = null) {
         this.appDeclaration = appDeclaration;
         this.tabLimit = tabLimit;
         this.secondAction = secondAction;
+    }
+
+    /** Runs `task` with exclusive access to this app's activities (re-entrant for calls made inside `task`). */
+    exclusive<T>(task: () => Promise<T>): Promise<T> {
+        return this.lock.run(task);
+    }
+
+    /** Runs `callback` outside the current lock context, so timers it starts queue for the lock instead of skipping it. */
+    outsideLock<T>(callback: () => T): T {
+        return this.lock.outside(callback);
     }
 
     getParentActivity(popId: string): ActivityInstance | undefined {

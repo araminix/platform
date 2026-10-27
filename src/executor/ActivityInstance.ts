@@ -73,7 +73,7 @@ export class ActivityDriver {
     }
 
     async trigger(actor: Actor): Promise<AppResult> {
-        return await this.activity.handleActor(actor);
+        return await this.instanceDriver.exclusive(() => this.activity.handleActor(actor));
     }
 }
 
@@ -231,7 +231,8 @@ export class ActivityInstance {
 
     async wake(): Promise<AppResult> {
         this.status = Status.Waked;
-        this.activityInterface.afterWake();
+        // afterWake is where activities start timers; keep them out of the current lock context.
+        this.driver.outsideLock(() => this.activityInterface.afterWake());
         if (this.popActivity) {
             return await this.popActivity.load();
         }
