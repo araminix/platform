@@ -1,6 +1,10 @@
 import { err, ok, Ok } from '@araminix/lib';
 import assert from 'node:assert';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { describe, it } from 'node:test';
+import { pathToFileURL } from 'node:url';
 import { Worker } from 'worker_threads';
 
 import AgentController, { AgentInstance } from '../src/agent/AgentController.js';
@@ -32,39 +36,30 @@ describe('Agent Worker Lifecycle and Concurrency', () => {
     });
 
     it('AgentInstance.init terminates worker and clears ping timer on timeout', async () => {
-        const dummyIndexUrl = new URL('file:///d:/dummy/agents.js');
+        // An agent index whose import never settles, so only the init timeout can end init().
+        // The timeout leaves the worker time to finish loading its own modules: terminating a worker
+        // while it is still loading a native addon (bufferutil via @araminix/lib) aborts the whole process.
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'araminix-stuck-agent-'));
+        const stuckIndexFile = path.join(dir, 'agents.mjs');
+        fs.writeFileSync(stuckIndexFile, 'await new Promise(() => {});\n');
+        const stuckIndexUrl = pathToFileURL(stuckIndexFile);
         const agentInfo = new AgentInfo('agent-timeout-1', 'testType');
-        const controller = new AgentController(dummyIndexUrl);
-
-        // Create an AgentInstance with a short timeout of 50ms
-        const instance = new AgentInstance(dummyIndexUrl, agentInfo, controller, 50);
+        const controller = new AgentController(stuckIndexUrl);
+        const instance = new AgentInstance(stuckIndexUrl, agentInfo, controller, 1500);
 
         // Ping timer should initially be set
         assert.ok((instance as any).timer !== undefined);
 
-        // Replace worker with a worker that runs an infinite loop or never responds
-        const stuckWorker = new Worker('while(true) {}', { eval: true });
-        let exitFired = false;
-        stuckWorker.on('exit', () => {
-            exitFired = true;
-        });
-
-        // Hook init to use stuckWorker
-        const origInit = instance.init.bind(instance);
-        const initPromise = (async () => {
-            // We can directly call init with 50ms timeout
-            // For this test, override the worker creation inside init
-            return await instance.init(() => {}, 50);
-        })();
-
-        const res = await initPromise;
-        assert.ok(res.isErr());
-        // Ping timer must be cleared
-        assert.strictEqual((instance as any).timer, undefined);
-        // Worker must be terminated/undefined
-        assert.strictEqual((instance as any).worker, undefined);
-        // Clean up stuckWorker if still running
-        await stuckWorker.terminate().catch(() => {});
+        try {
+            const res = await instance.init(() => {}, 1500);
+            assert.ok(res.isErr());
+            // Ping timer must be cleared
+            assert.strictEqual((instance as any).timer, undefined);
+            // Worker must be terminated/undefined
+            assert.strictEqual((instance as any).worker, undefined);
+        } finally {
+            fs.rmSync(dir, { recursive: true, force: true });
+        }
     });
 
     it('AgentInstance.destroy terminates worker and clears ping timer', async () => {
@@ -100,7 +95,9 @@ describe('Agent Worker Lifecycle and Concurrency', () => {
 
     it('AgentController.connect deletes entry from instances on Err', async () => {
         const dummyIndexUrl = new URL('file:///d:/dummy/agents.js');
-        const controller = new AgentController(dummyIndexUrl, 100);
+        // The missing index makes the worker exit on its own; a short init timeout would instead race
+        // the worker's module loading (see the timeout test above).
+        const controller = new AgentController(dummyIndexUrl, 5000);
         const agentInfo = new AgentInfo('agent-err-cleanup', 'invalidType');
 
         let denied = false;

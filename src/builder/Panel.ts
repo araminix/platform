@@ -53,9 +53,15 @@ function panel(init: { render: RenderAsync | RenderSync; styles?: Styles } | Ren
     try {
         const result: unknown = render();
         if (result instanceof Promise) {
-            return result.then(() => {
-                builder.popPanel();
-            });
+            return result.then(
+                () => {
+                    builder.popPanel();
+                },
+                (error: unknown) => {
+                    builder.popPanel();
+                    throw error;
+                },
+            );
         }
         builder.popPanel();
     } catch (e) {

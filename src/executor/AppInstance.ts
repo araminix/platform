@@ -349,8 +349,12 @@ export class AppInstance {
             this.active.suspend();
         }
         const idx = this.index.findIndex((act) => act.driver.id === id);
-        this.historyRemove(this.index[idx]);
-        this.index[idx] = activity;
+        if (idx === -1) {
+            this.index.push(activity);
+        } else {
+            this.historyRemove(this.index[idx]);
+            this.index[idx] = activity;
+        }
         this.activate(activity);
     }
 
@@ -361,7 +365,7 @@ export class AppInstance {
         this.index.push(activity);
         if (this.index.length > this.tabLimit) {
             const toClose = this.history[1];
-            if (this.active !== toClose) {
+            if (toClose && this.active !== toClose) {
                 const idx = this.index.findIndex((act) => act === toClose);
                 this.index.splice(idx, 1);
                 this.historyRemove(toClose);
@@ -385,7 +389,7 @@ export class AppInstance {
 
     async cancel(id: string): Promise<AppResult> {
         if (id === this.activeId) {
-            await this.active.cancel();
+            return await this.active.cancel();
         }
         return new Err(AppError.NonActive);
     }

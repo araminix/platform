@@ -1,3 +1,5 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
+
 import type { ActivityDriver } from '../executor/ActivityInstance.js';
 import type { Actor } from '../lib/actors.js';
 import type { FragmentInterface } from './Fragment.js';
@@ -17,29 +19,41 @@ export type BuildedPart = {
     content?: Array<BuildedPart>;
 };
 
+type BuildState = {
+    fragments: Map<string, FragmentInterface>;
+    mainPanel?: Panel;
+    panelStack: Panel[];
+    activityFragmentDriver?: ActivityDriver;
+};
+
 class Builder {
-    private fragments: Map<string, FragmentInterface> = new Map();
-    private mainPanel?: Panel = undefined;
-    private panelStack: Panel[] = [];
-    private activityFragmentDriver?: ActivityDriver;
+    // Every build() gets its own async context, so renders that overlap (e.g. a timer-triggered refresh) cannot mix fragments.
+    private storage: AsyncLocalStorage<BuildState> = new AsyncLocalStorage();
+    private fallback: BuildState = { fragments: new Map(), panelStack: [] };
+
+    private get state(): BuildState {
+        return this.storage.getStore() ?? this.fallback;
+    }
 
     pushPanel(panel: Panel): void {
-        if (!this.mainPanel) {
-            this.mainPanel = panel;
+        const state = this.state;
+        if (!state.mainPanel) {
+            state.mainPanel = panel;
         } else {
-            this.panelStack[this.panelStack.length - 1]._addPanel(panel);
+            state.panelStack[state.panelStack.length - 1]._addPanel(panel);
         }
-        this.panelStack.push(panel);
+        state.panelStack.push(panel);
     }
 
     addFragment(fragmentBuilderDriver: FragmentInterface): ActivityDriver {
-        this.panelStack[this.panelStack.length - 1]._addFragment(fragmentBuilderDriver);
-        this.fragments.set(fragmentBuilderDriver.id, fragmentBuilderDriver);
-        return this.activityFragmentDriver!;
+        const state = this.state;
+        state.panelStack[state.panelStack.length - 1]._addFragment(fragmentBuilderDriver);
+        state.fragments.set(fragmentBuilderDriver.id, fragmentBuilderDriver);
+        return state.activityFragmentDriver!;
     }
 
     popPanel(): void {
-        this.panelStack.pop();
+        this.state.panelStack.pop();
     }
 
     async build(
@@ -49,22 +63,18 @@ class Builder {
         fragments: Map<string, FragmentInterface>;
         mainPanel: Panel;
     }> {
-        this.activityFragmentDriver = fragmentDriver;
-        this.fragments = new Map();
-        this.mainPanel = new Panel(undefined);
-        this.panelStack = [this.mainPanel];
-
-        await render();
-
-        const result = {
-            fragments: this.fragments,
-            mainPanel: this.mainPanel,
+        const mainPanel = new Panel(undefined);
+        const state: BuildState = {
+            fragments: new Map(),
+            mainPanel,
+            panelStack: [mainPanel],
+            activityFragmentDriver: fragmentDriver,
         };
-        this.fragments = new Map();
-        this.mainPanel = undefined;
-        this.activityFragmentDriver = undefined;
-        this.panelStack = [];
-        return result;
+        await this.storage.run(state, render);
+        return {
+            fragments: state.fragments,
+            mainPanel,
+        };
     }
 }
 

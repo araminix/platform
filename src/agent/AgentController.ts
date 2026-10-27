@@ -26,12 +26,14 @@ export class AgentInstance {
     }, 30000);
     private controller: AgentController;
     private initTimeoutMs: number;
+    private requestTimeoutMs: number;
 
-    constructor(workerIndex: URL, info: AgentInfo, controller: AgentController, initTimeoutMs: number = 5000) {
+    constructor(workerIndex: URL, info: AgentInfo, controller: AgentController, initTimeoutMs: number = 5000, requestTimeoutMs: number = 0) {
         this.workerIndex = workerIndex;
         this.info = info;
         this.controller = controller;
         this.initTimeoutMs = initTimeoutMs;
+        this.requestTimeoutMs = requestTimeoutMs;
         if (this.timer && typeof this.timer.unref === 'function') {
             this.timer.unref();
         }
@@ -48,7 +50,7 @@ export class AgentInstance {
                 requestPort: responseChannel.port2,
                 workerIndexPath: this.workerIndex.href,
             };
-            this.requestSocket = new RequestSocket(requestChannel.port1, deserialize);
+            this.requestSocket = new RequestSocket(requestChannel.port1, deserialize, this.requestTimeoutMs);
             this.responseSocket = new ResponseSocket(responseChannel.port1, deserialize);
             this.worker = new Worker(new URL('./worker.js', import.meta.url));
             const [promise, resolve] = deal<R>();
@@ -259,10 +261,12 @@ export default class AgentController {
     private instances: Map<string, AgentInstance> = new Map();
     private pending: Map<string, Promise<R>> = new Map();
     private initTimeoutMs: number;
+    private requestTimeoutMs: number;
 
-    constructor(workerIndex: URL, initTimeoutMs: number = 5000) {
+    constructor(workerIndex: URL, initTimeoutMs: number = 5000, requestTimeoutMs: number = 0) {
         this.workerIndex = workerIndex;
         this.initTimeoutMs = initTimeoutMs;
+        this.requestTimeoutMs = requestTimeoutMs;
     }
 
     async task(id: string, taskName: string, data: t.Any | unknown, hp: number): Promise<Result<any, undefined>> {
@@ -308,7 +312,7 @@ export default class AgentController {
             worker = undefined;
         }
         if (!worker) {
-            worker = new AgentInstance(this.workerIndex, info, this, timeoutMs ?? this.initTimeoutMs);
+            worker = new AgentInstance(this.workerIndex, info, this, timeoutMs ?? this.initTimeoutMs, this.requestTimeoutMs);
             this.instances.set(info.id, worker);
             const initPromise = worker.init(() => {
                 this.instances.delete(info.id);

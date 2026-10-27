@@ -10,11 +10,13 @@ export enum AcceptError {
 export class ConnectRequest {
     readonly info: ClientInfo;
     private connection: Connection | undefined = undefined;
+    private readonly onAccept?: () => void;
     readonly arg: string;
 
-    constructor(connection: Connection, info: ClientInfo) {
+    constructor(connection: Connection, info: ClientInfo, onAccept?: () => void) {
         this.info = info;
         this.connection = connection;
+        this.onAccept = onAccept;
         this.arg = this.connection.arg;
     }
 
@@ -27,6 +29,7 @@ export class ConnectRequest {
         if (connection.accept().isErr()) {
             return new Err(AcceptError.Write);
         }
+        this.onAccept?.();
         return new Ok(new Socket(connection));
     }
 

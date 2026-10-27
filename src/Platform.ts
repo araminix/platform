@@ -7,6 +7,8 @@ import { AppIndex, AppListing } from './lib/d.js';
 import { AuthProvider, ClientInfo, ClientType } from './server/AuthProvider.js';
 import Endpoint, { MinioOptions, RateLimitConfig, UploadAllowlist } from './server/Endpoint.js';
 
+const DEFAULT_WORKER_REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
+
 export interface PlatformConfig {
     appIndexPath: URL;
     agentIndexPath: URL;
@@ -14,6 +16,7 @@ export interface PlatformConfig {
     instanceUserLimit: number;
     maxInstances?: number;
     resourceLimits?: ResourceLimits;
+    workerRequestTimeoutMs?: number;
     port?: number;
     mount?: string;
     cookieSecret?: string;
@@ -46,6 +49,10 @@ export default class Platform {
     private agentController: AgentController;
     readonly instances: Map<string, Map<string, Instance>> = new Map();
 
+    private get workerRequestTimeoutMs(): number {
+        return this.config.workerRequestTimeoutMs ?? DEFAULT_WORKER_REQUEST_TIMEOUT_MS;
+    }
+
     get totalInstances(): number {
         let total = 0;
         for (const userInstances of this.instances.values()) {
@@ -69,7 +76,7 @@ export default class Platform {
             authRateLimit: config.authRateLimit,
             minio: config.minio,
         });
-        this.agentController = new AgentController(this.config.agentIndexPath);
+        this.agentController = new AgentController(this.config.agentIndexPath, undefined, this.workerRequestTimeoutMs);
         this.serve();
     }
 
@@ -334,7 +341,17 @@ export default class Platform {
                     return LoopResult.Cont;
                 }
 
-                const instance = new Instance(userId, appName, profile, this.config.appIndexPath, this.config.tabLimit ?? 12, this.agentController, this.config.resourceLimits);
+                const instance = new Instance(
+                    userId,
+                    appName,
+                    profile,
+                    this.config.appIndexPath,
+                    this.config.tabLimit ?? 12,
+                    this.agentController,
+                    this.config.resourceLimits,
+                    undefined,
+                    this.workerRequestTimeoutMs,
+                );
                 createdInstance = instance;
                 instances.set(instance.id, instance);
                 const instanceInitResult = await instance.init(() => {

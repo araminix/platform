@@ -45,6 +45,7 @@ export default class Instance {
     readonly agentController: AgentController;
     readonly resourceLimits?: ResourceLimits;
     readonly terminationGracePeriodMs: number;
+    readonly requestTimeoutMs: number;
     private worker?: Worker = undefined;
     private requestSocket?: RequestSocket = undefined;
     private responseSocket?: ResponseSocket = undefined;
@@ -66,6 +67,7 @@ export default class Instance {
         agentController: AgentController,
         resourceLimits?: ResourceLimits,
         terminationGracePeriodMs: number = 500,
+        requestTimeoutMs: number = 0,
     ) {
         this.userId = userId;
         this.appName = appName;
@@ -75,6 +77,7 @@ export default class Instance {
         this.agentController = agentController;
         this.resourceLimits = resourceLimits;
         this.terminationGracePeriodMs = terminationGracePeriodMs;
+        this.requestTimeoutMs = requestTimeoutMs;
     }
 
     get isDestroyed(): boolean {
@@ -284,7 +287,7 @@ export default class Instance {
             appIndexPath: this.appIndexPath.href,
             tabLimit: this.tabLimit,
         };
-        this.requestSocket = new RequestSocket(requestChannel.port1, deserialize);
+        this.requestSocket = new RequestSocket(requestChannel.port1, deserialize, this.requestTimeoutMs);
         this.responseSocket = new ResponseSocket(responseChannel.port1, deserialize);
         const resourceLimits: ResourceLimits = this.resourceLimits ?? {
             maxOldGenerationSizeMb: 128,

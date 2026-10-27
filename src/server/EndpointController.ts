@@ -7,6 +7,7 @@ import { ConnectRequest } from './ConnectRequest.js';
 class ConnectionEntry {
     token: string;
     connection: Connection;
+    accepted: boolean = false;
 
     constructor(token: string, connection: Connection) {
         this.token = token;
@@ -37,12 +38,15 @@ export default class EndpointController {
 
     private addConnection(connectionEntry: ConnectionEntry, connectionId: string, info: ClientInfo): void {
         this.connections.set(connectionId, connectionEntry);
+        const request = new ConnectRequest(connectionEntry.connection, info, () => {
+            connectionEntry.accepted = true;
+        });
         if (this.promise) {
-            this.promise(new Ok(new ConnectRequest(connectionEntry.connection, info)));
+            this.promise(new Ok(request));
             this.promise = undefined;
             return;
         }
-        this.connectionQueue.push(new ConnectRequest(connectionEntry.connection, info));
+        this.connectionQueue.push(request);
     }
 
     async connect(ws: WebSocket, token: string, info: ClientInfo, arg: string): Promise<void> {
@@ -90,11 +94,14 @@ export default class EndpointController {
         }
         connectionEntry.token = token;
         connectionEntry.connection.connect(ws as any);
-        connectionEntry.connection.accept();
+        // Only repeat accept_endpoint for connections the app already accepted; pending ones wait for its decision.
+        if (connectionEntry.accepted) {
+            connectionEntry.connection.accept();
+        }
     }
 
     deauthUser<INFO extends ClientInfo>(info: INFO, token: string): void {
-        const connectionId = `${info.clientType}/${info.runtimeId}`;
+        const connectionId = `${info.clientType}/${info.runtimeId}/`;
         this.connections.forEach((connectionEntry, id) => {
             if (id.startsWith(connectionId) && connectionEntry.token === token) {
                 connectionEntry.connection.destroy(CloseCodes.Unauthorized);

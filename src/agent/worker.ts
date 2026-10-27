@@ -1,4 +1,4 @@
-import { deal, Err, Ok, Result } from '@araminix/lib';
+import { deal, Err, logger, Ok, Result } from '@araminix/lib';
 import { parentPort } from 'worker_threads';
 
 import { AgentPost, Data, deserialize } from '../executor/proto.js';
@@ -27,8 +27,16 @@ class AgentWorker {
             switch (true) {
                 case request instanceof AgentPost: {
                     const agentPost = request as AgentPost;
-                    const result = await this.agent.onPost(agentPost.name, agentPost.data);
-                    this.responseSocket.resolve(new Data((result as any).serialize()));
+                    let response: unknown;
+                    try {
+                        const result = await this.agent.onPost(agentPost.name, agentPost.data);
+                        response = (result as any).serialize();
+                    } catch (error) {
+                        // A throwing onPost answers this post with an error instead of killing the agent worker.
+                        logger.error(`Agent onPost '${agentPost.name}' failed:`, error);
+                        response = new Err(error instanceof Error ? error.message : String(error)).serialize();
+                    }
+                    this.responseSocket.resolve(new Data(response));
                     break;
                 }
                 default: {
