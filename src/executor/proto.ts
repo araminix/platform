@@ -2,7 +2,7 @@ import { MessagePort } from 'worker_threads';
 
 import type { BuildedPart } from '../builder/builder.js';
 import { UpdateTypes } from '../lib/actors.js';
-import { Rej, Req, Res } from '../lib/worker_socket.js';
+import { Rej, Req, Res, typeNameOf } from '../lib/worker_socket.js';
 
 export interface Build {
     isPop: boolean;
@@ -12,6 +12,7 @@ export interface Build {
 }
 
 export class AcquireAgent extends Req {
+    static readonly typeName = 'AcquireAgent';
     type: string;
     readonly agentId: string;
 
@@ -23,6 +24,7 @@ export class AcquireAgent extends Req {
 }
 
 export class AgentTask<TData = unknown> extends Req {
+    static readonly typeName = 'AgentTask';
     id: string;
     readonly name: string;
     readonly data: TData;
@@ -38,6 +40,7 @@ export class AgentTask<TData = unknown> extends Req {
 }
 
 export class AgentPost<TData = unknown> extends Req {
+    static readonly typeName = 'AgentPost';
     readonly name: string;
     readonly data: TData;
 
@@ -49,6 +52,7 @@ export class AgentPost<TData = unknown> extends Req {
 }
 
 export class AgentList extends Req {
+    static readonly typeName = 'AgentList';
     type: string;
 
     constructor(type: string) {
@@ -58,6 +62,7 @@ export class AgentList extends Req {
 }
 
 export class SendBuild extends Req {
+    static readonly typeName = 'SendBuild';
     readonly data: Build;
 
     constructor(data: Build) {
@@ -67,6 +72,7 @@ export class SendBuild extends Req {
 }
 
 export class SendPush<TData = unknown> extends Req {
+    static readonly typeName = 'SendPush';
     readonly data: TData;
 
     constructor(data: TData) {
@@ -83,6 +89,7 @@ export interface Update<TData = unknown> {
 }
 
 export class SendUpdate<TData = unknown> extends Req {
+    static readonly typeName = 'SendUpdate';
     readonly data: Update<TData>;
 
     constructor(data: Update<TData>) {
@@ -92,6 +99,7 @@ export class SendUpdate<TData = unknown> extends Req {
 }
 
 export class Data<T = unknown> extends Res {
+    static readonly typeName = 'Data';
     readonly data: T;
 
     constructor(data: T) {
@@ -101,12 +109,14 @@ export class Data<T = unknown> extends Res {
 }
 
 export class NotFound extends Rej {
+    static readonly typeName = 'NotFound';
     constructor() {
         super();
     }
 }
 
 export class Other<TErr = unknown> extends Rej {
+    static readonly typeName = 'Other';
     readonly err: TErr;
 
     constructor(err: TErr) {
@@ -116,6 +126,7 @@ export class Other<TErr = unknown> extends Rej {
 }
 
 export class Action<TData = unknown> extends Req {
+    static readonly typeName = 'Action';
     readonly fragmentId: string;
     readonly name: string;
     readonly data: TData;
@@ -129,6 +140,7 @@ export class Action<TData = unknown> extends Req {
 }
 
 export class Query<TData = unknown> extends Req {
+    static readonly typeName = 'Query';
     readonly fragmentId: string;
     readonly name: string;
     readonly data: TData;
@@ -142,6 +154,7 @@ export class Query<TData = unknown> extends Req {
 }
 
 export class Reload extends Req {
+    static readonly typeName = 'Reload';
     readonly activityId: string;
 
     constructor(activityId: string) {
@@ -151,6 +164,7 @@ export class Reload extends Req {
 }
 
 export class Load extends Req {
+    static readonly typeName = 'Load';
     constructor() {
         super();
     }
@@ -165,6 +179,7 @@ export type ActivityList = Array<{
 }>;
 
 export class UpdateActivityList extends Req {
+    static readonly typeName = 'UpdateActivityList';
     readonly list: ActivityList;
 
     constructor(list: ActivityList) {
@@ -174,6 +189,7 @@ export class UpdateActivityList extends Req {
 }
 
 export class Refresh extends Req {
+    static readonly typeName = 'Refresh';
     readonly activityId: string;
 
     constructor(activityId: string) {
@@ -183,6 +199,7 @@ export class Refresh extends Req {
 }
 
 export class Switch extends Req {
+    static readonly typeName = 'Switch';
     readonly activityId: string;
 
     constructor(activityId: string) {
@@ -192,6 +209,7 @@ export class Switch extends Req {
 }
 
 export class Close extends Req {
+    static readonly typeName = 'Close';
     readonly activityId: string;
 
     constructor(activityId: string) {
@@ -201,6 +219,7 @@ export class Close extends Req {
 }
 
 export class Prev extends Req {
+    static readonly typeName = 'Prev';
     readonly activityId: string;
 
     constructor(activityId: string) {
@@ -210,6 +229,7 @@ export class Prev extends Req {
 }
 
 export class Suspend extends Req {
+    static readonly typeName = 'Suspend';
     constructor() {
         super();
     }
@@ -220,49 +240,49 @@ export function deserialize(message: any): Req | Res | Rej | undefined {
         return undefined;
     }
     switch (message._type) {
-        case AgentPost.name:
+        case typeNameOf(AgentPost):
             return new AgentPost(message.name, message.data);
-        case AgentTask.name:
+        case typeNameOf(AgentTask):
             return new AgentTask(message.id, message.name, message.data, message.hp);
-        case AcquireAgent.name:
+        case typeNameOf(AcquireAgent):
             return new AcquireAgent(message.type, message.agentId);
-        case AgentList.name:
+        case typeNameOf(AgentList):
             return new AgentList(message.type);
-        case NotFound.name:
+        case typeNameOf(NotFound):
             return new NotFound();
-        case Other.name:
+        case typeNameOf(Other):
             return new Other(message.err);
-        case SendUpdate.name:
+        case typeNameOf(SendUpdate):
             return new SendUpdate(message.data);
-        case SendBuild.name:
+        case typeNameOf(SendBuild):
             return new SendBuild(message.data);
-        case SendPush.name:
+        case typeNameOf(SendPush):
             return new SendPush(message.data);
-        case Data.name:
+        case typeNameOf(Data):
             return new Data(message.data);
-        case Reload.name:
+        case typeNameOf(Reload):
             return new Reload(message.activityId);
-        case Switch.name:
+        case typeNameOf(Switch):
             return new Switch(message.activityId);
-        case Load.name:
+        case typeNameOf(Load):
             return new Load();
-        case Close.name:
+        case typeNameOf(Close):
             return new Close(message.activityId);
-        case Prev.name:
+        case typeNameOf(Prev):
             return new Prev(message.activityId);
-        case UpdateActivityList.name:
+        case typeNameOf(UpdateActivityList):
             return new UpdateActivityList(message.list);
-        case Refresh.name:
+        case typeNameOf(Refresh):
             return new Refresh(message.activityId);
-        case Suspend.name:
+        case typeNameOf(Suspend):
             return new Suspend();
-        case Action.name:
+        case typeNameOf(Action):
             return new Action(message.fragmentId, message.name, message.data);
-        case Query.name:
+        case typeNameOf(Query):
             return new Query(message.fragmentId, message.name, message.data);
-        case Res.name:
+        case typeNameOf(Res):
             return new Res();
-        case Rej.name:
+        case typeNameOf(Rej):
             return new Rej();
         default:
             return undefined;

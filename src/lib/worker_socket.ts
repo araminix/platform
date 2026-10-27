@@ -7,8 +7,14 @@ export enum MessageRole {
     Reject = 2,
 }
 
+export function typeNameOf(typeClass: { readonly name: string; readonly typeName?: string }): string {
+    // Only a class's own typeName counts, so an undeclared subclass is not mistaken for its parent.
+    return Object.prototype.hasOwnProperty.call(typeClass, 'typeName') && typeClass.typeName ? typeClass.typeName : typeClass.name;
+}
+
 abstract class Message {
-    readonly _type: string = (this.constructor as typeof Message).name;
+    static readonly typeName?: string;
+    readonly _type: string = typeNameOf(this.constructor as typeof Message);
     abstract readonly _role: MessageRole;
     _rid?: number;
 }
@@ -18,10 +24,12 @@ export abstract class Req extends Message {
 }
 
 export class Res extends Message {
+    static readonly typeName: string = 'Res';
     readonly _role = MessageRole.Resolve;
 }
 
 export class Rej extends Message {
+    static readonly typeName: string = 'Rej';
     readonly _role = MessageRole.Reject;
 }
 

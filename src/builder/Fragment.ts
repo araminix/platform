@@ -3,6 +3,7 @@ import { uuid } from '@araminix/lib';
 import type { ActivityDriver } from '../executor/ActivityInstance.js';
 import type { AppResult } from '../executor/AppInstance.js';
 import { Actor, Nothing, ReloadFragment, UpdateFragment, UpdateTypes } from '../lib/actors.js';
+import { typeNameOf } from '../lib/worker_socket.js';
 import type { BuildedPart, OnAction, Part, Response } from './builder.js';
 import builder from './builder.js';
 
@@ -43,6 +44,7 @@ export class FragmentInterface implements Part {
 }
 
 export default abstract class Fragment<I extends { styles?: Array<string> | undefined }, O = unknown> {
+    static readonly typeName?: string;
     readonly input: I;
     readonly id: string;
     private actions: Map<string, OnAction<any>> = new Map();
@@ -55,7 +57,8 @@ export default abstract class Fragment<I extends { styles?: Array<string> | unde
         this.id = uuid();
         this.driver = builder.addFragment(
             new FragmentInterface(
-                this.constructor.name,
+                // The frontend picks its component by this name; declare `static typeName` if the server code is minified.
+                typeNameOf(this.constructor as typeof Fragment),
                 this.id,
                 this.input.styles,
                 this.actions,
