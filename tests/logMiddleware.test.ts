@@ -65,4 +65,38 @@ describe('LogMiddleware', () => {
             Logger.prototype.info = originalInfo;
         }
     });
+
+    it('measures realistic elapsed duration and formats without redundant timestamp prefix', async () => {
+        let loggedMessage = '';
+        const originalInfo = Logger.prototype.info;
+        Logger.prototype.info = function (...args: any[]) {
+            loggedMessage = args.map(String).join(' ');
+        };
+
+        try {
+            const req = {
+                method: 'POST',
+                url: '/api/test',
+            } as any;
+            const res = new EventEmitter() as any;
+            res.statusCode = 200;
+
+            logMiddleware(req, res, () => {});
+
+            // Simulate small delay
+            await new Promise((resolve) => setTimeout(resolve, 20));
+            res.emit('finish');
+
+            // Must match format: METHOD: URL STATUS DURATIONms
+            assert.match(loggedMessage, /^POST: \/api\/test 200 \d+\.\d{2}ms$/);
+
+            // Extract duration and verify it is reasonable (around 20ms, definitely not 1000000+ ms process uptime)
+            const match = loggedMessage.match(/(\d+\.\d{2})ms$/);
+            assert.ok(match, 'Duration not found in logged message');
+            const duration = parseFloat(match[1]);
+            assert.ok(duration >= 15 && duration < 2000, `Duration ${duration}ms was not in expected range`);
+        } finally {
+            Logger.prototype.info = originalInfo;
+        }
+    });
 });

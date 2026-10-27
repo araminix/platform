@@ -9,10 +9,9 @@ class LogMiddleware extends Logger {
         return LOG_LEVEL.DEBUG;
     }
 
-    getDuration(): number {
+    getStartTime(): [number, number] | number {
         if (typeof process !== 'undefined' && process.hrtime) {
-            const hrtime = process.hrtime();
-            return hrtime[0] * 1e3 + hrtime[1] / 1e6;
+            return process.hrtime();
         } else if (typeof performance !== 'undefined' && performance.now) {
             return performance.now();
         } else {
@@ -20,13 +19,30 @@ class LogMiddleware extends Logger {
         }
     }
 
+    getDuration(start?: [number, number] | number | bigint): number {
+        if (typeof start === 'bigint') {
+            const end = typeof process !== 'undefined' && process.hrtime && process.hrtime.bigint ? process.hrtime.bigint() : BigInt(Date.now() * 1e6);
+            return Number(end - start) / 1e6;
+        }
+        if (Array.isArray(start) && typeof process !== 'undefined' && process.hrtime) {
+            const diff = process.hrtime(start);
+            return diff[0] * 1e3 + diff[1] / 1e6;
+        }
+        if (typeof start === 'number') {
+            const now = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
+            return now - start;
+        }
+        return 0;
+    }
+
     get(): (req: Request, res: Response, next: NextFunction) => void {
         return (req: Request, res: Response, next: NextFunction): void => {
             const { method, url } = req;
+            const start = this.getStartTime();
             res.once('finish', () => {
                 const sanitizedUrl = url.replace(/\/ws-token\/[^/?#]+/g, '/ws-token/[REDACTED]');
-                const duration = `${this.getDuration().toFixed(2)}ms`;
-                const log = `[${Logger.getTimestamp()}] ${method}: ${sanitizedUrl} ${res.statusCode} ${duration}`;
+                const duration = `${this.getDuration(start).toFixed(2)}ms`;
+                const log = `${method}: ${sanitizedUrl} ${res.statusCode} ${duration}`;
                 this[this.statusLevel(res.statusCode)](log);
             });
             next();
