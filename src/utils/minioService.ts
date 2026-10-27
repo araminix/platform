@@ -69,9 +69,13 @@ export class MinioService {
 
     constructor(options: MinioOptions) {
         this.validateOptions(options);
-        const { bucketName, expiry = 24 * 60 * 60, ...minioClient } = options;
+        const { bucketName, expiry = 15 * 60, ...minioClient } = options;
         this.minioClient = minioClient;
         this.additionalParams = { bucketName, expiry };
+    }
+
+    get expiry(): number {
+        return this.additionalParams.expiry;
     }
 
     private validateOptions(options: MinioOptions): void {
@@ -100,8 +104,8 @@ export class MinioService {
 
     private setFileExtension(mimetype: MIME_TYPE, fileName: string): string {
         const ext = MimeToExtension[mimetype];
-        if (ext && !fileName.endsWith(ext)) {
-            return `${fileName}${ext}`;
+        if (ext && ext !== '*' && !fileName.endsWith(`.${ext}`) && !fileName.endsWith(ext)) {
+            return fileName.endsWith('.') ? `${fileName}${ext}` : `${fileName}.${ext}`;
         }
         return fileName;
     }

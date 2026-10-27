@@ -9,10 +9,12 @@ import type { Server } from 'http';
 import multer from 'multer';
 import path from 'path';
 
-import { logMiddleware, MinioOptions, MinioService } from '../utils/index.js';
+import { logMiddleware, MIME_TYPE, MimeToExtension, MinioOptions, MinioService } from '../utils/index.js';
 import { AuthProvider, ClientInfo, GoogleData } from './AuthProvider.js';
 import { ConnectRequest } from './ConnectRequest.js';
 import EndpointController from './EndpointController.js';
+
+export { MinioOptions };
 
 interface CustomRequest extends Request {
     token?: string;
@@ -749,33 +751,142 @@ export default class Endpoint {
 
     private initMinio(minio: MinioOptions): void {
         const minioService = new MinioService(minio);
+
         this.express.post(`${this.mount}/attachments/upload`, validateToken, async (req: CustomRequest, res) => {
-            const { attachmentId, mimetype, fileName } = req.body;
-            if (!attachmentId || !mimetype || !fileName) {
-                res.status(400).send({ message: 'attachmentId, mimetype, and fileName are required.' }).end();
-                return;
+            try {
+                if (!req.info?.id) {
+                    res.status(401).send({ message: 'Unauthorized' }).end();
+                    return;
+                }
+
+                const { mimetype, fileName } = req.body || {};
+                if (!mimetype || typeof mimetype !== 'string' || !fileName || typeof fileName !== 'string') {
+                    res.status(400).send({ message: 'mimetype and fileName are required strings.' }).end();
+                    return;
+                }
+
+                const decodedFileName = (() => {
+                    try {
+                        return decodeURIComponent(fileName);
+                    } catch {
+                        return fileName;
+                    }
+                })();
+
+                if (
+                    fileName.includes('..') ||
+                    fileName.startsWith('/') ||
+                    fileName.startsWith('\\') ||
+                    decodedFileName.includes('..') ||
+                    decodedFileName.startsWith('/') ||
+                    decodedFileName.startsWith('\\')
+                ) {
+                    res.status(400).send({ message: 'Invalid fileName: path traversal and leading slash are not allowed.' }).end();
+                    return;
+                }
+
+                let ext = path.extname(fileName).replace(/^\./, '').trim().toLowerCase();
+                if (!ext && mimetype) {
+                    const mimeExt = MimeToExtension[mimetype as MIME_TYPE];
+                    if (mimeExt && mimeExt !== '*') {
+                        ext = mimeExt.toLowerCase();
+                    }
+                }
+                if (ext && !/^[a-zA-Z0-9]+$/.test(ext)) {
+                    ext = '';
+                }
+
+                const userId = req.info.id;
+                const fileId = uuid();
+                const key = ext ? `${userId}/${fileId}.${ext}` : `${userId}/${fileId}`;
+
+                const urlResult = await minioService.presignedPutObject(mimetype as MIME_TYPE, key);
+                if (urlResult.isErr()) {
+                    logger.error('Error on Upload Request API: ', urlResult.e);
+                    res.status(500).send({ error: urlResult.e }).end();
+                    return;
+                }
+                const url = urlResult.unwrap();
+                res.status(200).json({ url, key, attachmentId: key }).end();
+            } catch (error) {
+                logger.error('Error on Upload Request API: ', error);
+                res.status(500).send({ error }).end();
             }
-            const minioFileName = `${req.info?.id}/${fileName}`;
-            const urlResult = await minioService.presignedPutObject(mimetype, minioFileName);
-            if (urlResult.isErr()) {
-                logger.error('Error on Upload Request API: ', urlResult.e);
-                res.status(500).send(urlResult.e).end();
-                return;
-            }
-            const url = urlResult.unwrap();
-            res.status(200).json({ url }).end();
         });
 
-        this.express.get(`${this.mount}/attachments/:attachmentId`, validateToken, async (req, res) => {
+        const handleGetAttachment = async (req: CustomRequest, res: Response) => {
             try {
-                const attachmentId = String(req.params.attachmentId);
-                const fileURL = await minioService.presignedGetObject(attachmentId);
+                if (!req.info?.id) {
+                    res.status(401).send({ message: 'Unauthorized' }).end();
+                    return;
+                }
+
+                let attachmentId = '';
+                if (req.params.userId && req.params.fileName) {
+                    attachmentId = `${req.params.userId}/${req.params.fileName}`;
+                } else if (req.params.attachmentId) {
+                    attachmentId = String(req.params.attachmentId);
+                }
+
+                if (!attachmentId) {
+                    res.status(400).send({ message: 'attachmentId is required.' }).end();
+                    return;
+                }
+
+                const decoded = (() => {
+                    try {
+                        return decodeURIComponent(attachmentId);
+                    } catch {
+                        return attachmentId;
+                    }
+                })();
+
+                if (
+                    attachmentId.includes('..') ||
+                    attachmentId.startsWith('/') ||
+                    attachmentId.startsWith('\\') ||
+                    decoded.includes('..') ||
+                    decoded.startsWith('/') ||
+                    decoded.startsWith('\\')
+                ) {
+                    res.status(400).send({ message: 'Invalid attachmentId: path traversal and leading slash are not allowed.' }).end();
+                    return;
+                }
+
+                const userId = req.info.id;
+                let objectKey: string;
+
+                if (attachmentId.startsWith(`${userId}/`)) {
+                    objectKey = attachmentId;
+                } else if (!attachmentId.includes('/')) {
+                    objectKey = `${userId}/${attachmentId}`;
+                } else {
+                    logger.error(`IDOR attempt or unauthorized attachment access denied for user '${userId}': ${attachmentId}`);
+                    res.status(403).send({ message: 'Forbidden: access to attachment denied.' }).end();
+                    return;
+                }
+
+                if (objectKey === `${userId}/` || objectKey.endsWith('/')) {
+                    res.status(400).send({ message: 'Invalid attachmentId: file name cannot be empty.' }).end();
+                    return;
+                }
+
+                const fileURLResult = await minioService.presignedGetObject(objectKey);
+                if (fileURLResult.isErr()) {
+                    logger.error('Error on Get File API: ', fileURLResult.e);
+                    res.status(500).send({ error: fileURLResult.e }).end();
+                    return;
+                }
+                const fileURL = fileURLResult.unwrap();
                 res.status(200).json({ fileURL }).end();
             } catch (error) {
                 logger.error('Error on Get File API: ', error);
-                res.status(500).send(error).end();
+                res.status(500).send({ error }).end();
             }
-        });
+        };
+
+        this.express.get(`${this.mount}/attachments/:attachmentId`, validateToken, handleGetAttachment);
+        this.express.get(`${this.mount}/attachments/:userId/:fileName`, validateToken, handleGetAttachment);
     }
 
     private initMobileRequests(): void {

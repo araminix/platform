@@ -4,7 +4,7 @@ import AgentController from './agent/AgentController.js';
 import Instance from './executor/Instance.js';
 import { AppIndex, AppListing } from './lib/d.js';
 import { AuthProvider, ClientInfo, ClientType } from './server/AuthProvider.js';
-import Endpoint, { RateLimitConfig, UploadAllowlist } from './server/Endpoint.js';
+import Endpoint, { MinioOptions, RateLimitConfig, UploadAllowlist } from './server/Endpoint.js';
 
 export interface PlatformConfig {
     appIndexPath: URL;
@@ -21,6 +21,7 @@ export interface PlatformConfig {
     googleClientIds?: string[];
     allowedOrigins?: string[];
     authRateLimit?: RateLimitConfig | boolean;
+    minio?: MinioOptions;
     onCustomStream?: {
         [key: string]: (client: ClientInfo, stream: Stream) => Promise<void>;
     };
@@ -55,6 +56,7 @@ export default class Platform {
             googleClientIds: config.googleClientIds,
             allowedOrigins: config.allowedOrigins,
             authRateLimit: config.authRateLimit,
+            minio: config.minio,
         });
         this.agentController = new AgentController(this.config.agentIndexPath);
         this.serve();
