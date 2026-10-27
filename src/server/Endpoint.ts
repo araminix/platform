@@ -785,13 +785,10 @@ export default class Endpoint {
                     return;
                 }
 
-                let ext = path.extname(fileName).replace(/^\./, '').trim().toLowerCase();
-                if (!ext && mimetype) {
-                    const mimeExt = MimeToExtension[mimetype as MIME_TYPE];
-                    if (mimeExt && mimeExt !== '*') {
-                        ext = mimeExt.toLowerCase();
-                    }
-                }
+                // Prefer the mimetype's extension: MinioService appends it to any key that doesn't already end with it,
+                // so using it here keeps the returned key identical to the object name that gets presigned.
+                const mimeExt = MimeToExtension[mimetype as MIME_TYPE];
+                let ext = mimeExt && mimeExt !== '*' ? mimeExt : path.extname(fileName).replace(/^\./, '').trim().toLowerCase();
                 if (ext && !/^[a-zA-Z0-9]+$/.test(ext)) {
                     ext = '';
                 }

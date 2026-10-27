@@ -183,6 +183,25 @@ describe('MinIO Attachments: IDOR and Key Injection Defenses', () => {
             assert.strictEqual(res.status, 200);
             assert.match(res.body.key, /^user-1\/[a-f0-9-]+\.png$/i);
         });
+
+        it('returns exactly the object name MinioService presigns, even when fileName extension and mimetype disagree', async () => {
+            const service = new MinioService({ endPoint: 'localhost', port: 9000, accessKey: 'minioadmin', secretKey: 'minioadmin', bucketName: 'attachments-bucket' });
+            const cases = [
+                { fileName: 'photo.jpeg', mimetype: 'image/jpeg', ext: 'jpg' },
+                { fileName: 'report.png', mimetype: 'application/pdf', ext: 'pdf' },
+                { fileName: 'notes', mimetype: 'text/plain', ext: 'txt' },
+                { fileName: 'diagram.drawio', mimetype: 'application/octet-stream', ext: 'drawio' },
+                { fileName: 'board.bin', mimetype: 'application/x-custom', ext: 'bin' },
+            ];
+
+            for (const c of cases) {
+                const res = await request(endpoint.express).post('/attachments/upload').set('x-token', 'user1-token').send({ fileName: c.fileName, mimetype: c.mimetype });
+                assert.strictEqual(res.status, 200);
+                assert.ok(res.body.key.endsWith(`.${c.ext}`), `${c.fileName} (${c.mimetype}) produced key ${res.body.key}`);
+                const presignedObjectName = (service as any).setFileExtension(capturedPutMime, capturedPutKey);
+                assert.strictEqual(presignedObjectName, res.body.key, `${c.fileName} (${c.mimetype}): presigned object name must equal the returned key`);
+            }
+        });
     });
 
     describe('GET /attachments/:attachmentId', () => {
