@@ -55,6 +55,25 @@ export interface EndpointOptions {
     googleClientIds?: string[];
     allowedOrigins?: string[];
     authRateLimit?: RateLimitConfig | boolean;
+    maxMessageBytes?: number;
+    heartbeatIntervalMs?: number;
+    trustProxy?: boolean | number | string;
+}
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// AuthProvider error codes (strings/numbers) are meant for the client; other values may carry internals.
+function clientError(error: unknown, fallback: string): string | number {
+    return typeof error === 'string' || typeof error === 'number' ? error : fallback;
+}
+
+// Axios errors carry the request config, including URLs and Authorization headers with tokens.
+function loggableError(error: unknown): unknown {
+    if (error && typeof error === 'object' && (error as { isAxiosError?: boolean }).isAxiosError) {
+        const axiosError = error as { message?: string; code?: string; response?: { status?: number } };
+        return { message: axiosError.message, code: axiosError.code, status: axiosError.response?.status };
+    }
+    return error;
 }
 
 function validateToken(req: CustomRequest, res: Response, next: NextFunction): void {
@@ -100,6 +119,8 @@ export default class Endpoint {
     private allowedOrigins?: string[];
     private authRateLimit?: RateLimitConfig | boolean;
     private authRateLimiter: any;
+    private heartbeatIntervalMs: number;
+    private readonly wsInstance: expressWs.Instance;
     readonly express: expressWs.Application;
     private server?: Server;
     private readonly connections: Map<string, unknown> = new Map();
@@ -111,7 +132,7 @@ export default class Endpoint {
         port = 3000,
         mount,
         version,
-        cookieSecret = uuid(),
+        cookieSecret,
         sessionTtl = 3600 * 24,
         uploadDir,
         minio = undefined,
@@ -121,12 +142,19 @@ export default class Endpoint {
         googleClientIds,
         allowedOrigins,
         authRateLimit,
+        maxMessageBytes = 16 * 1024 * 1024,
+        heartbeatIntervalMs = 30000,
+        trustProxy,
     }: EndpointOptions) {
         this.authProvider = authProvider;
         this.port = port;
         this.mount = mount ? `/${trimSlash(mount)}` : '';
         this.version = version ?? '0.0.0';
-        this.cookieSecret = cookieSecret;
+        if (!cookieSecret) {
+            logger.warn('Endpoint: no cookieSecret configured. A random secret is used, so sessions end on restart and cannot be shared between server instances.');
+        }
+        this.cookieSecret = cookieSecret || uuid();
+        this.heartbeatIntervalMs = heartbeatIntervalMs;
         this.sessionTtl = sessionTtl;
         this.uploadDir = uploadDir;
         this.minio = minio;
@@ -173,6 +201,7 @@ export default class Endpoint {
             ...cookieOptions,
         };
         const wsOptions: any = {
+            maxPayload: maxMessageBytes,
             verifyClient: (info: any, cb: (res: boolean, code?: number, message?: string) => void) => {
                 const origin = info.origin || info.req?.headers?.origin || info.req?.headers?.['sec-websocket-origin'];
                 const allowed = this.checkOrigin(origin);
@@ -182,7 +211,11 @@ export default class Endpoint {
                 return cb(false, 403, 'Forbidden');
             },
         };
-        this.express = expressWs(expressCore(), undefined, { wsOptions }).app;
+        this.wsInstance = expressWs(expressCore(), undefined, { wsOptions });
+        this.express = this.wsInstance.app;
+        if (trustProxy !== undefined) {
+            this.express.set('trust proxy', trustProxy);
+        }
         this.init();
     }
 
@@ -244,7 +277,33 @@ export default class Endpoint {
             ws.close(WsCloseCodes.NotFound);
             return;
         }
+        this.startHeartbeat(ws);
         await endpoint.connect(ws, token, info, arg);
+    }
+
+    // Detects half-open sockets (clients that vanished without a close frame) so their connections can expire.
+    private startHeartbeat(ws: any): void {
+        if (this.heartbeatIntervalMs <= 0 || typeof ws.ping !== 'function' || typeof ws.on !== 'function') {
+            return;
+        }
+        let alive = true;
+        ws.on('pong', () => {
+            alive = true;
+        });
+        const timer = setInterval(() => {
+            if (!alive) {
+                ws.terminate();
+                return;
+            }
+            alive = false;
+            try {
+                ws.ping();
+            } catch {
+                // the close handler clears the timer
+            }
+        }, this.heartbeatIntervalMs);
+        timer.unref?.();
+        ws.on('close', () => clearInterval(timer));
     }
 
     private deauth(info: ClientInfo, token: string): void {
@@ -255,6 +314,9 @@ export default class Endpoint {
 
     private initMiddleware(): void {
         this.express.use(async (req: CustomRequest, _res: Response, next: NextFunction) => {
+            if (req.path === `${this.mount}/health` || req.path === `${this.mount}/version`) {
+                return next();
+            }
             const cookieToken = req.signedCookies?.token;
             const headerToken = req.header('x-token');
             req.token = cookieToken ? cookieToken : headerToken ? headerToken : undefined;
@@ -379,7 +441,9 @@ export default class Endpoint {
             const result = await this.authProvider.auth(req.body);
             if (result.isErr()) {
                 logger.error('API Auth - Login Error: ', result.e);
-                res.status(401).send({ error: result.e }).end();
+                res.status(401)
+                    .send({ error: clientError(result.e, 'Unauthorized') })
+                    .end();
                 return;
             }
             const authResponse = result.unwrap();
@@ -411,14 +475,14 @@ export default class Endpoint {
                 }),
             );
             if (tokenInfoResult.isErr()) {
-                logger.error('Google Auth Token Info Error: ', tokenInfoResult.e);
-                res.status(401).send({ error: tokenInfoResult.e }).end();
+                logger.error('Google Auth Token Info Error: ', loggableError(tokenInfoResult.e));
+                res.status(401).send({ error: 'Invalid Google token' }).end();
                 return;
             }
             const tokenInfoResponse = tokenInfoResult.unwrap();
             if (tokenInfoResponse.status !== 200 || !tokenInfoResponse.data) {
                 logger.error('Google Auth Token Info Status not 200: ', tokenInfoResponse.data);
-                res.status(401).send({ error: tokenInfoResponse.data }).end();
+                res.status(401).send({ error: 'Invalid Google token' }).end();
                 return;
             }
 
@@ -445,14 +509,14 @@ export default class Endpoint {
                 }),
             );
             if (userInfoResult.isErr()) {
-                logger.error('Google Auth API Error: ', userInfoResult.e);
-                res.status(401).send({ error: userInfoResult.e }).end();
+                logger.error('Google Auth API Error: ', loggableError(userInfoResult.e));
+                res.status(401).send({ error: 'Invalid Google token' }).end();
                 return;
             }
             const authResponse = userInfoResult.unwrap();
             if (authResponse.status !== 200) {
                 logger.error('Google Auth Status not 200: ', authResponse.data);
-                res.status(401).send({ error: authResponse.data }).end();
+                res.status(401).send({ error: 'Invalid Google token' }).end();
                 return;
             }
             const googleData = authResponse.data;
@@ -474,7 +538,9 @@ export default class Endpoint {
                 const authRes = await this.authProvider.googleAuth(googleData);
                 if (authRes.isErr()) {
                     logger.error('Google Auth Provider Error: ', authRes.e);
-                    res.status(401).send({ error: authRes.e }).end();
+                    res.status(401)
+                        .send({ error: clientError(authRes.e, 'Unauthorized') })
+                        .end();
                     return;
                 }
                 const response = authRes.unwrap();
@@ -498,10 +564,17 @@ export default class Endpoint {
         });
 
         this.express.put(`${this.mount}/auth/refresh`, this.authRateLimiter, async (req, res) => {
-            const result = await this.authProvider.refreshToken(req.body.old_token);
+            const oldToken = req.body?.old_token;
+            if (!oldToken || typeof oldToken !== 'string') {
+                res.status(400).send({ message: '"old_token" is required in body.' }).end();
+                return;
+            }
+            const result = await this.authProvider.refreshToken(oldToken);
             if (result.isErr()) {
                 logger.error('API Auth - Refresh Token Error: ', result.e);
-                res.status(401).send({ error: result.e }).end();
+                res.status(401)
+                    .send({ error: clientError(result.e, 'Unauthorized') })
+                    .end();
                 return;
             }
             const token = result.unwrap();
@@ -622,6 +695,10 @@ export default class Endpoint {
 
         this.express.get(`${this.mount}/file/:fileId`, validateToken, (req, res) => {
             const fileId = String(req.params.fileId);
+            if (!UUID_PATTERN.test(fileId)) {
+                res.status(404).end();
+                return;
+            }
             const dir = path.join(uploadDir, fileId);
             fs.readFile(path.join(dir, 'index.json'), (err, data) => {
                 if (err) {
@@ -668,12 +745,15 @@ export default class Endpoint {
                 const result = await this.authProvider.request2FA(req.info?.id ?? '');
                 if (!result.isOk()) {
                     logger.error('API Auth - 2FA Request Error: ', result.e);
-                    res.status(401).send({ error: result.e }).end();
+                    res.status(401)
+                        .send({ error: clientError(result.e, 'Unauthorized') })
+                        .end();
                     return;
                 }
                 res.status(200).send({ url: result.v }).end();
             } catch (error) {
-                res.status(500).send({ error }).end();
+                logger.error('Request failed:', error);
+                res.status(500).send({ error: 'Internal server error' }).end();
             }
         });
 
@@ -685,7 +765,7 @@ export default class Endpoint {
          * matches the secret that the server issued in `request2FA` for this user, rather than
          * blindly accepting an arbitrary secret provided by the client.
          */
-        this.express.post(`${this.mount}/2fa/enable`, validateToken, async (req: CustomRequest, res) => {
+        this.express.post(`${this.mount}/2fa/enable`, validateToken, this.authRateLimiter, async (req: CustomRequest, res) => {
             try {
                 const { code, secret } = req.body;
                 if (!code) {
@@ -699,12 +779,15 @@ export default class Endpoint {
                 const result = await this.authProvider.enable2FA(req.info?.id ?? '', secret, code);
                 if (!result.isOk()) {
                     logger.error('API Auth - 2FA Enable Error: ', result.e);
-                    res.status(401).send({ error: result.e }).end();
+                    res.status(401)
+                        .send({ error: clientError(result.e, 'Unauthorized') })
+                        .end();
                     return;
                 }
                 res.status(200).send({ success: result.v }).end();
             } catch (error) {
-                res.status(500).send({ error }).end();
+                logger.error('Request failed:', error);
+                res.status(500).send({ error: 'Internal server error' }).end();
             }
         });
 
@@ -718,7 +801,9 @@ export default class Endpoint {
                 const result = await this.authProvider.verify2FA(accountName, code, uuidCode);
                 if (result.isErr()) {
                     logger.error('API Auth - 2FA Verify Error: ', result.e);
-                    res.status(401).send({ error: result.e }).end();
+                    res.status(401)
+                        .send({ error: clientError(result.e, 'Unauthorized') })
+                        .end();
                     return;
                 }
                 const verifyResponse = result.unwrap();
@@ -728,23 +813,27 @@ export default class Endpoint {
                     res.cookie('token', verifyResponse, this.COOKIE_OPTIONS).status(200).end();
                 }
             } catch (error) {
-                res.status(500).send({ error }).end();
+                logger.error('Request failed:', error);
+                res.status(500).send({ error: 'Internal server error' }).end();
             }
         });
 
-        this.express.delete(`${this.mount}/2fa/disable`, validateToken, async (req: CustomRequest, res) => {
+        this.express.delete(`${this.mount}/2fa/disable`, validateToken, this.authRateLimiter, async (req: CustomRequest, res) => {
             try {
                 const rawCode = req.body?.code ?? req.query?.code;
                 const code = rawCode !== undefined && rawCode !== null ? String(rawCode) : undefined;
                 const result = await this.authProvider.disable2FA(req.info?.id ?? '', code);
                 if (result.isErr()) {
                     logger.error('API Auth - 2FA Disable Error: ', result.e);
-                    res.status(401).send({ error: result.e }).end();
+                    res.status(401)
+                        .send({ error: clientError(result.e, 'Unauthorized') })
+                        .end();
                     return;
                 }
                 res.status(200).send({ success: result.unwrap() }).end();
             } catch (error) {
-                res.status(500).send({ error }).end();
+                logger.error('Request failed:', error);
+                res.status(500).send({ error: 'Internal server error' }).end();
             }
         });
     }
@@ -800,14 +889,14 @@ export default class Endpoint {
                 const urlResult = await minioService.presignedPutObject(mimetype as MIME_TYPE, key);
                 if (urlResult.isErr()) {
                     logger.error('Error on Upload Request API: ', urlResult.e);
-                    res.status(500).send({ error: urlResult.e }).end();
+                    res.status(500).send({ error: 'Failed to create upload URL' }).end();
                     return;
                 }
                 const url = urlResult.unwrap();
                 res.status(200).json({ url, key, attachmentId: key }).end();
             } catch (error) {
                 logger.error('Error on Upload Request API: ', error);
-                res.status(500).send({ error }).end();
+                res.status(500).send({ error: 'Internal server error' }).end();
             }
         });
 
@@ -871,14 +960,14 @@ export default class Endpoint {
                 const fileURLResult = await minioService.presignedGetObject(objectKey);
                 if (fileURLResult.isErr()) {
                     logger.error('Error on Get File API: ', fileURLResult.e);
-                    res.status(500).send({ error: fileURLResult.e }).end();
+                    res.status(500).send({ error: 'Failed to create download URL' }).end();
                     return;
                 }
                 const fileURL = fileURLResult.unwrap();
                 res.status(200).json({ fileURL }).end();
             } catch (error) {
                 logger.error('Error on Get File API: ', error);
-                res.status(500).send({ error }).end();
+                res.status(500).send({ error: 'Internal server error' }).end();
             }
         };
 
@@ -906,7 +995,8 @@ export default class Endpoint {
                 }
                 res.status(result.status).send(result).end();
             } catch (error) {
-                res.status(500).send({ error }).end();
+                logger.error('Request failed:', error);
+                res.status(500).send({ error: 'Internal server error' }).end();
             }
         });
     }
@@ -918,6 +1008,8 @@ export default class Endpoint {
     }
 
     close(): void {
+        // server.close() only stops new connections; open WebSockets would keep it (and the process) alive.
+        this.wsInstance.getWss().clients.forEach((client) => client.terminate());
         if (this.server) {
             this.server.close();
         }

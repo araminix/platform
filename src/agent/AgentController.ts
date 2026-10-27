@@ -71,7 +71,7 @@ export class AgentInstance {
             });
             this.worker.on('error', (error: unknown) => {
                 if (error !== true) {
-                    console.log('worker error', error);
+                    logger.error('Agent worker error:', error);
                 }
                 resolve(err());
             });

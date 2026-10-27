@@ -3,10 +3,9 @@ import type { NextFunction, Request, Response } from 'express';
 
 class LogMiddleware extends Logger {
     statusLevel(status: number): LOG_LEVEL {
-        if (status >= 200 && status < 300) return LOG_LEVEL.INFO;
-        if (status >= 300 && status < 400) return LOG_LEVEL.WARN;
-        if (status >= 400 && status < 500) return LOG_LEVEL.ERROR;
-        return LOG_LEVEL.DEBUG;
+        if (status >= 500) return LOG_LEVEL.ERROR;
+        if (status >= 400) return LOG_LEVEL.WARN;
+        return LOG_LEVEL.INFO;
     }
 
     getStartTime(): [number, number] | number {

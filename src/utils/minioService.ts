@@ -54,6 +54,7 @@ export interface MinioClient {
     accessKey: string;
     secretKey: string;
     useSSL?: boolean;
+    region?: string;
 }
 
 export interface MinioOptions extends MinioClient {
@@ -66,6 +67,7 @@ export class MinioService {
     private readonly minioClient: MinioClient;
     private readonly additionalParams: { bucketName: string; expiry: number };
     private isInitialized = false;
+    private initPromise?: Promise<void>;
 
     constructor(options: MinioOptions) {
         this.validateOptions(options);
@@ -88,12 +90,21 @@ export class MinioService {
 
     private async init(): Promise<void> {
         if (this.isInitialized) return;
-        this.client = new Minio.Client(this.minioClient);
-        const exists = await this.client.bucketExists(this.additionalParams.bucketName);
-        if (!exists) {
-            await this.client.makeBucket(this.additionalParams.bucketName, 'us-east-1');
+        // Concurrent first calls share one initialisation instead of racing makeBucket.
+        if (!this.initPromise) {
+            this.initPromise = (async () => {
+                this.client = new Minio.Client(this.minioClient);
+                const exists = await this.client.bucketExists(this.additionalParams.bucketName);
+                if (!exists) {
+                    await this.client.makeBucket(this.additionalParams.bucketName, this.minioClient.region ?? 'us-east-1');
+                }
+                this.isInitialized = true;
+            })();
+            this.initPromise.catch(() => {
+                this.initPromise = undefined;
+            });
         }
-        this.isInitialized = true;
+        await this.initPromise;
     }
 
     private async ensureInitialized(): Promise<void> {
