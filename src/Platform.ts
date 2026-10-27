@@ -1,4 +1,5 @@
 import { Err, logger, loop, LoopResult, Ok, Result, Socket, Stream, t } from '@araminix/lib';
+import { ResourceLimits } from 'worker_threads';
 
 import AgentController from './agent/AgentController.js';
 import Instance from './executor/Instance.js';
@@ -11,6 +12,8 @@ export interface PlatformConfig {
     agentIndexPath: URL;
     authProvider: AuthProvider;
     instanceUserLimit: number;
+    maxInstances?: number;
+    resourceLimits?: ResourceLimits;
     port?: number;
     mount?: string;
     cookieSecret?: string;
@@ -42,6 +45,14 @@ export default class Platform {
     private appIndex!: AppIndex<any>;
     private agentController: AgentController;
     readonly instances: Map<string, Map<string, Instance>> = new Map();
+
+    get totalInstances(): number {
+        let total = 0;
+        for (const userInstances of this.instances.values()) {
+            total += userInstances.size;
+        }
+        return total;
+    }
 
     constructor(config: PlatformConfig) {
         this.config = config;
@@ -138,6 +149,10 @@ export default class Platform {
                     return LoopResult.Cont;
                 }
                 instance.destroy();
+                userInstances.delete(instanceId);
+                if (userInstances.size === 0) {
+                    this.instances.delete(runtimeId);
+                }
                 stream.closeOk();
                 return LoopResult.Cont;
             } catch (err) {
@@ -291,16 +306,36 @@ export default class Platform {
                     stream.closeErr();
                     return LoopResult.Cont;
                 }
-                const instance = new Instance(userId, appName, profile, this.config.appIndexPath, this.config.tabLimit ?? 12, this.agentController);
-                createdInstance = instance;
                 if (!this.instances.has(runtimeId)) {
                     this.instances.set(runtimeId, new Map());
                 }
                 const instances = this.instances.get(runtimeId)!;
-                if (instances.size === this.config.instanceUserLimit) {
-                    const first = instances.entries().next().value;
-                    first?.[1].destroy();
+                const limit = this.config.instanceUserLimit;
+                while (instances.size >= limit) {
+                    let oldest: Instance | undefined;
+                    for (const inst of instances.values()) {
+                        if (!oldest || inst.touched < oldest.touched) {
+                            oldest = inst;
+                        }
+                    }
+                    if (!oldest) {
+                        break;
+                    }
+                    instances.delete(oldest.id);
+                    oldest.destroy();
                 }
+
+                if (this.config.maxInstances !== undefined && this.totalInstances >= this.config.maxInstances) {
+                    if (instances.size === 0) {
+                        this.instances.delete(runtimeId);
+                    }
+                    logger.warn(`Global instance limit reached (${this.totalInstances}/${this.config.maxInstances}). Rejecting createInstance.`);
+                    stream.closeErr();
+                    return LoopResult.Cont;
+                }
+
+                const instance = new Instance(userId, appName, profile, this.config.appIndexPath, this.config.tabLimit ?? 12, this.agentController, this.config.resourceLimits);
+                createdInstance = instance;
                 instances.set(instance.id, instance);
                 const instanceInitResult = await instance.init(() => {
                     const insts = this.instances.get(runtimeId);
@@ -322,7 +357,12 @@ export default class Platform {
                 }
                 const writeResult = await stream.write(instance.id);
                 if (writeResult.isErr()) {
+                    instances.delete(instance.id);
+                    if (instances.size === 0) {
+                        this.instances.delete(runtimeId);
+                    }
                     instance.destroy();
+                    return LoopResult.Cont;
                 }
                 stream.closeOk();
                 return LoopResult.Cont;
@@ -398,11 +438,11 @@ export default class Platform {
     }
 
     stop(): void {
-        this.instances.forEach((userInstances) => {
-            userInstances.forEach((instance) => {
+        for (const userInstances of this.instances.values()) {
+            for (const instance of [...userInstances.values()]) {
                 instance.destroy();
-            });
-        });
+            }
+        }
         this.instances.clear();
         this.endpoint.close();
     }

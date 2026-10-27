@@ -1,5 +1,5 @@
 import { deal, Err, err, logger, Ok, ok, once, R, Result, Socket, StreamCloseCodes, t, uuid } from '@araminix/lib';
-import { MessageChannel, Worker } from 'worker_threads';
+import { MessageChannel, ResourceLimits, Worker } from 'worker_threads';
 
 import AgentController from '../agent/AgentController.js';
 import { Rej, RequestSocket, Res, ResponseSocket } from '../lib/worker_socket.js';
@@ -43,9 +43,11 @@ export default class Instance {
     readonly appIndexPath: URL;
     readonly tabLimit: number;
     readonly agentController: AgentController;
+    readonly resourceLimits?: ResourceLimits;
+    readonly terminationGracePeriodMs: number;
     private worker?: Worker = undefined;
-    private requestSocket!: RequestSocket;
-    private responseSocket!: ResponseSocket;
+    private requestSocket?: RequestSocket = undefined;
+    private responseSocket?: ResponseSocket = undefined;
     private status: Status = Status.Created;
     readonly id: string = uuid();
     appTitle: string = '';
@@ -53,22 +55,42 @@ export default class Instance {
     private onDestroy?: () => void = undefined;
     private _touched: number = Date.now();
     private userSocket?: Socket = undefined;
+    private terminationTimer?: NodeJS.Timeout = undefined;
 
-    constructor(userId: string, appName: string, profile: string | null, appIndexPath: URL, tabLimit: number, agentController: AgentController) {
+    constructor(
+        userId: string,
+        appName: string,
+        profile: string | null,
+        appIndexPath: URL,
+        tabLimit: number,
+        agentController: AgentController,
+        resourceLimits?: ResourceLimits,
+        terminationGracePeriodMs: number = 500,
+    ) {
         this.userId = userId;
         this.appName = appName;
         this.profile = profile;
         this.appIndexPath = appIndexPath;
         this.tabLimit = tabLimit;
         this.agentController = agentController;
+        this.resourceLimits = resourceLimits;
+        this.terminationGracePeriodMs = terminationGracePeriodMs;
+    }
+
+    get isDestroyed(): boolean {
+        return this.status === Status.Destroyed;
     }
 
     get touched(): number {
         return this._touched;
     }
 
+    touch(time: number = Date.now()): void {
+        this._touched = time;
+    }
+
     connect(socket: Socket): void {
-        this._touched = Date.now();
+        this.touch();
         if (this.userSocket) {
             this.userSocket.destroy();
         }
@@ -106,6 +128,9 @@ export default class Instance {
     }
 
     private async load(): Promise<Result<void, IncomingStreamErr>> {
+        if (!this.requestSocket) {
+            return new Err(IncomingStreamErr.Execution);
+        }
         const result = await this.requestSocket.writeRead(new Load());
         if (result.isErr()) {
             return new Err(IncomingStreamErr.Execution);
@@ -116,6 +141,9 @@ export default class Instance {
     private async reload(args: unknown): Promise<Result<void, IncomingStreamErr>> {
         if (typeof args !== 'string') {
             return new Err(IncomingStreamErr.Format);
+        }
+        if (!this.requestSocket) {
+            return new Err(IncomingStreamErr.Execution);
         }
         const result = await this.requestSocket.writeRead(new Reload(args));
         if (result.isErr()) {
@@ -128,6 +156,9 @@ export default class Instance {
         if (typeof args !== 'string') {
             return new Err(IncomingStreamErr.Format);
         }
+        if (!this.requestSocket) {
+            return new Err(IncomingStreamErr.Execution);
+        }
         const result = await this.requestSocket.writeRead(new Prev(args));
         if (result.isErr()) {
             return new Err(IncomingStreamErr.Execution);
@@ -138,6 +169,9 @@ export default class Instance {
     private async close(args: unknown): Promise<Result<void, IncomingStreamErr>> {
         if (typeof args !== 'string') {
             return new Err(IncomingStreamErr.Format);
+        }
+        if (!this.requestSocket) {
+            return new Err(IncomingStreamErr.Execution);
         }
         const result = await this.requestSocket.writeRead(new Close(args));
         if (result.isErr()) {
@@ -150,6 +184,9 @@ export default class Instance {
         if (typeof args !== 'string') {
             return new Err(IncomingStreamErr.Format);
         }
+        if (!this.requestSocket) {
+            return new Err(IncomingStreamErr.Execution);
+        }
         const result = await this.requestSocket.writeRead(new Switch(args));
         if (result.isErr()) {
             return new Err(IncomingStreamErr.Execution);
@@ -160,6 +197,9 @@ export default class Instance {
     private async refresh(args: unknown): Promise<Result<void, IncomingStreamErr>> {
         if (typeof args !== 'string') {
             return new Err(IncomingStreamErr.Format);
+        }
+        if (!this.requestSocket) {
+            return new Err(IncomingStreamErr.Execution);
         }
         const result = await this.requestSocket.writeRead(new Refresh(args));
         if (result.isErr()) {
@@ -177,6 +217,9 @@ export default class Instance {
         if (!argsType.is(args)) {
             return new Err(IncomingStreamErr.Format);
         }
+        if (!this.requestSocket) {
+            return new Err(IncomingStreamErr.Execution);
+        }
         const result = await this.requestSocket.writeRead(new Action(args.fragmentId, args.name, args.data));
         if (result.isErr()) {
             return new Err(IncomingStreamErr.Execution);
@@ -192,6 +235,9 @@ export default class Instance {
         });
         if (!argsType.is(args)) {
             return new Err(IncomingStreamErr.Format);
+        }
+        if (!this.requestSocket) {
+            return new Err(IncomingStreamErr.Execution);
         }
         const result = await this.requestSocket.writeRead(new Query(args.fragmentId, args.name, args.data));
         if (result.isErr() || !(result.unwrap() instanceof Data)) {
@@ -222,9 +268,10 @@ export default class Instance {
 
     async init(onDestroy: () => void): Promise<R> {
         if (this.status !== Status.Created) {
-            console.log('Tried to initiate more than once');
-            return ok();
+            logger.warn('Tried to initiate instance more than once or when not in Created status');
+            return err();
         }
+        this.onDestroy = onDestroy;
         this.status = Status.Initiating;
         const requestChannel = new MessageChannel();
         const responseChannel = new MessageChannel();
@@ -239,7 +286,13 @@ export default class Instance {
         };
         this.requestSocket = new RequestSocket(requestChannel.port1, deserialize);
         this.responseSocket = new ResponseSocket(responseChannel.port1, deserialize);
-        this.worker = new Worker(new URL('./worker.js', import.meta.url));
+        const resourceLimits: ResourceLimits = this.resourceLimits ?? {
+            maxOldGenerationSizeMb: 128,
+            stackSizeMb: 4,
+        };
+        this.worker = new Worker(new URL('./worker.js', import.meta.url), {
+            resourceLimits,
+        });
         const [promise, resolve] = deal<R>();
         this.worker.postMessage(workerInit, [workerInit.requestPort, workerInit.responsePort]);
         this.worker.on('message', (appTitle: string) => {
@@ -252,33 +305,80 @@ export default class Instance {
         });
         this.worker.on('error', (error: unknown) => {
             if (error !== true) {
-                console.log('worker error', error);
+                logger.error('worker error', error);
             }
             resolve(err());
         });
 
         const result = await promise;
-        if (result.isOk()) {
-            this.onDestroy = onDestroy;
+        if (result.isOk() && !this.isDestroyed) {
             this.status = Status.Initiated;
             this.responseLoop().then();
             return result;
         }
-        this.status = Status.Destroyed;
-        return result;
+        this.destroy();
+        return err();
     }
 
     destroy(): void {
-        if (this.onDestroy) {
-            this.onDestroy();
-            this.onDestroy = undefined;
+        const cleanup = this.onDestroy;
+        this.onDestroy = undefined;
+        if (cleanup) {
+            try {
+                cleanup();
+            } catch (err) {
+                logger.error('Error during instance onDestroy cleanup:', err);
+            }
         }
-        this.requestSocket.close();
+
+        if (this.status === Status.Destroyed) {
+            return;
+        }
+        this.status = Status.Destroyed;
+
+        try {
+            this.requestSocket?.close();
+        } catch {}
+
+        try {
+            this.responseSocket?.close();
+        } catch {}
+
+        if (this.userSocket) {
+            try {
+                this.userSocket.destroy();
+            } catch {}
+            this.userSocket = undefined;
+        }
+
+        if (this.worker) {
+            const worker = this.worker;
+            this.worker = undefined;
+            if (this.terminationTimer) {
+                clearTimeout(this.terminationTimer);
+                this.terminationTimer = undefined;
+            }
+            this.terminationTimer = setTimeout(() => {
+                this.terminationTimer = undefined;
+                worker.terminate().catch((err) => {
+                    logger.error('Error terminating worker:', err);
+                });
+            }, this.terminationGracePeriodMs);
+            if (typeof this.terminationTimer.unref === 'function') {
+                this.terminationTimer.unref();
+            }
+            worker.once('exit', () => {
+                if (this.terminationTimer) {
+                    clearTimeout(this.terminationTimer);
+                    this.terminationTimer = undefined;
+                }
+            });
+        }
     }
 
     private async outgoingStream(name: string, arg: unknown): Promise<void> {
-        if (!this.userSocket) {
-            this.responseSocket.write(new Rej());
+        if (!this.userSocket || !this.responseSocket) {
+            this.responseSocket?.write(new Rej());
             return;
         }
         const streamResult = await this.userSocket.outgoingStream(name, arg);
@@ -296,7 +396,10 @@ export default class Instance {
     }
 
     private async responseLoop(): Promise<void> {
-        while (true) {
+        while (this.status !== Status.Destroyed) {
+            if (!this.responseSocket) {
+                break;
+            }
             const result = await this.responseSocket.read();
             if (result.isErr()) {
                 break;
@@ -355,10 +458,6 @@ export default class Instance {
                 }
             }
         }
-        this.status = Status.Destroyed;
-        this.requestSocket.close();
-        if (this.onDestroy) {
-            this.onDestroy();
-        }
+        this.destroy();
     }
 }
