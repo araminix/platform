@@ -41,14 +41,35 @@ export interface EndpointOptions {
     maxUploadBytes?: number;
     uploadAllowlist?: UploadAllowlist;
     googleClientIds?: string[];
+    allowedOrigins?: string[];
 }
 
 function validateToken(req: CustomRequest, res: Response, next: NextFunction): void {
     if (!req.token || !req.info) {
         res.status(401).send({ message: 'Unauthorized' }).end();
-    } else {
-        next();
+        return;
     }
+
+    const isMutation = ['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method.toUpperCase());
+    const isCookieAuth = Boolean(req.signedCookies?.token && !req.header('x-token'));
+
+    if (isMutation && isCookieAuth) {
+        const contentType = req.headers['content-type'];
+        const hasJson = Boolean(req.is('application/json') || (typeof contentType === 'string' && contentType.toLowerCase().includes('application/json')));
+        const hasCustomHeader = Boolean(req.header('x-requested-with') || req.header('x-csrf-token'));
+
+        if (!hasJson && !hasCustomHeader) {
+            res.status(403)
+                .json({
+                    error: 'Forbidden: Content-Type: application/json or custom header (e.g. X-Requested-With) required for cookie-authenticated requests',
+                    message: 'Forbidden',
+                })
+                .end();
+            return;
+        }
+    }
+
+    next();
 }
 
 export default class Endpoint {
@@ -63,6 +84,7 @@ export default class Endpoint {
     private maxUploadBytes: number;
     private uploadAllowlist?: UploadAllowlist;
     private googleClientIds?: string[];
+    private allowedOrigins?: string[];
     readonly express: expressWs.Application;
     private server?: Server;
     private readonly connections: Map<string, unknown> = new Map();
@@ -82,6 +104,7 @@ export default class Endpoint {
         maxUploadBytes = 20 * 1024 * 1024,
         uploadAllowlist,
         googleClientIds,
+        allowedOrigins,
     }: EndpointOptions) {
         this.authProvider = authProvider;
         this.port = port;
@@ -94,6 +117,7 @@ export default class Endpoint {
         this.maxUploadBytes = maxUploadBytes;
         this.uploadAllowlist = uploadAllowlist;
         this.googleClientIds = googleClientIds;
+        this.allowedOrigins = allowedOrigins;
         this.COOKIE_OPTIONS = {
             signed: true,
             httpOnly: true,
@@ -103,8 +127,39 @@ export default class Endpoint {
             maxAge: this.sessionTtl * 1000,
             ...cookieOptions,
         };
-        this.express = expressWs(expressCore()).app;
+        const wsOptions: any = {
+            verifyClient: (info: any, cb: (res: boolean, code?: number, message?: string) => void) => {
+                const origin = info.origin || info.req?.headers?.origin || info.req?.headers?.['sec-websocket-origin'];
+                const allowed = this.checkOrigin(origin);
+                if (allowed) {
+                    return cb(true);
+                }
+                return cb(false, 403, 'Forbidden');
+            },
+        };
+        this.express = expressWs(expressCore(), undefined, { wsOptions }).app;
         this.init();
+    }
+
+    private checkOrigin(origin?: string): boolean {
+        if (!origin) {
+            return true;
+        }
+        if (!this.allowedOrigins || this.allowedOrigins.length === 0) {
+            return false;
+        }
+        if (this.allowedOrigins.includes('*')) {
+            return true;
+        }
+        const normalized = origin.trim().toLowerCase().replace(/\/+$/, '');
+        return this.allowedOrigins.some((allowed) => {
+            return allowed.trim().toLowerCase().replace(/\/+$/, '') === normalized;
+        });
+    }
+
+    private isOriginAllowed(req: Request | any): boolean {
+        const origin = req.headers?.origin || req.headers?.['sec-websocket-origin'];
+        return this.checkOrigin(origin);
     }
 
     private init(): expressWs.Application {
@@ -174,6 +229,10 @@ export default class Endpoint {
          */
         this.express.ws(`${this.mount}/ws-token/:token/:endpoint/:arg`, async (ws, req: any) => {
             try {
+                if (!this.isOriginAllowed(req)) {
+                    ws.close(WsCloseCodes.Denied);
+                    return;
+                }
                 const token = String(req.params.token);
                 const endpointName = String(req.params.endpoint);
                 const arg = String(req.params.arg ?? '');
@@ -197,6 +256,10 @@ export default class Endpoint {
          */
         this.express.ws(`${this.mount}/ws-token/:token/:endpoint`, async (ws, req: any) => {
             try {
+                if (!this.isOriginAllowed(req)) {
+                    ws.close(WsCloseCodes.Denied);
+                    return;
+                }
                 const token = String(req.params.token);
                 const endpointName = String(req.params.endpoint);
                 const arg = '';
@@ -217,6 +280,10 @@ export default class Endpoint {
 
         this.express.ws(`${this.mount}/ws/:endpoint/:arg`, async (ws, req: CustomRequest) => {
             try {
+                if (!this.isOriginAllowed(req)) {
+                    ws.close(WsCloseCodes.Denied);
+                    return;
+                }
                 if (!req.info || !req.token) {
                     ws.close(WsCloseCodes.Unauthorized);
                     return;
@@ -234,6 +301,10 @@ export default class Endpoint {
 
         this.express.ws(`${this.mount}/ws/:endpoint`, async (ws, req: CustomRequest) => {
             try {
+                if (!this.isOriginAllowed(req)) {
+                    ws.close(WsCloseCodes.Denied);
+                    return;
+                }
                 if (!req.info || !req.token) {
                     ws.close(WsCloseCodes.Unauthorized);
                     return;

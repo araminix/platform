@@ -1,7 +1,10 @@
 import { deal, Ok } from '@araminix/lib';
 import axios from 'axios';
 import assert from 'node:assert';
+import fs from 'node:fs';
 import http from 'node:http';
+import os from 'node:os';
+import path from 'node:path';
 import { afterEach, beforeEach, describe, it } from 'node:test';
 import request from 'supertest';
 
@@ -523,5 +526,516 @@ describe('Endpoint Google OAuth Security (/gauth)', () => {
         const res = await request(endpoint.express).post('/gauth').send({ access_token: 'token-with-unverified-userinfo' });
 
         assert.strictEqual(res.status, 401);
+    });
+});
+
+describe('Endpoint Cross-Site WebSocket Hijacking Protection', () => {
+    let mockAuth: AuthProvider;
+    let endpoint: Endpoint;
+
+    beforeEach(() => {
+        mockAuth = {
+            getInfo: async (token: string) => {
+                if (token === 'valid-token') {
+                    return new Ok(new UserInfo('user-1', 'john', 'John Doe', 'rt-1', 'john@example.com', [], { _key: 'u1', name: 'Unit 1', code: 'U1' }));
+                }
+                return { isErr: () => true, isOk: () => false, unwrap: () => null } as any;
+            },
+            auth: async () => new Ok('valid-token'),
+            googleAuth: async () => new Ok('valid-token'),
+            destroy: async () => {},
+            refreshToken: async () => new Ok('valid-token'),
+            request2FA: async () => ({}) as any,
+            verify2FA: async () => new Ok('valid-token'),
+            enable2FA: async () => ({}) as any,
+            disable2FA: async () => ({}) as any,
+            requestUploadUrl: async () => ({}) as any,
+            requestDownloadUrl: async () => ({}) as any,
+            mobileRequests: async () => ({ status: 200 }) as any,
+        };
+    });
+
+    afterEach(() => {
+        if (endpoint) {
+            endpoint.close();
+        }
+    });
+
+    it('allows WebSocket upgrade when Origin matches allowedOrigins', async () => {
+        endpoint = new Endpoint({
+            authProvider: mockAuth,
+            port: 0,
+            cookieOptions: { secure: false },
+            allowedOrigins: ['https://app.example.com'],
+        });
+        endpoint.declare('agent');
+        endpoint.open();
+
+        const address = (endpoint as any).server?.address();
+        const port = typeof address === 'object' && address ? address.port : 3000;
+
+        const [upgradePromise, resolveUpgrade] = deal<{ statusCode: number }>();
+
+        const req = http.request({
+            port,
+            path: '/ws/agent',
+            agent: false,
+            headers: {
+                Connection: 'Upgrade',
+                Upgrade: 'websocket',
+                'Sec-WebSocket-Version': '13',
+                'Sec-WebSocket-Key': 'dGhlIHNhbXBsZSBub25jZQ==',
+                Origin: 'https://app.example.com',
+                'x-token': 'valid-token',
+            },
+        });
+
+        req.on('upgrade', (res, socket) => {
+            resolveUpgrade({ statusCode: res.statusCode || 101 });
+            socket.destroy();
+        });
+
+        req.end();
+
+        const upgradeResult = await upgradePromise;
+        assert.strictEqual(upgradeResult.statusCode, 101);
+    });
+
+    it('rejects WebSocket upgrade when Origin is not in allowedOrigins', async () => {
+        endpoint = new Endpoint({
+            authProvider: mockAuth,
+            port: 0,
+            cookieOptions: { secure: false },
+            allowedOrigins: ['https://app.example.com'],
+        });
+        endpoint.declare('agent');
+        endpoint.open();
+
+        const address = (endpoint as any).server?.address();
+        const port = typeof address === 'object' && address ? address.port : 3000;
+
+        const [rejectPromise, resolveReject] = deal<{ statusCode: number }>();
+
+        const req = http.request({
+            port,
+            path: '/ws/agent',
+            agent: false,
+            headers: {
+                Connection: 'Upgrade',
+                Upgrade: 'websocket',
+                'Sec-WebSocket-Version': '13',
+                'Sec-WebSocket-Key': 'dGhlIHNhbXBsZSBub25jZQ==',
+                Origin: 'https://evil.com',
+                'x-token': 'valid-token',
+            },
+        });
+
+        req.on('response', (res) => {
+            resolveReject({ statusCode: res.statusCode || 403 });
+        });
+
+        req.on('upgrade', (_res, socket) => {
+            socket.destroy();
+            resolveReject({ statusCode: 101 });
+        });
+
+        req.end();
+
+        const rejectResult = await rejectPromise;
+        assert.strictEqual(rejectResult.statusCode, 403);
+    });
+
+    it('allows WebSocket upgrade when Origin is missing (non-browser client)', async () => {
+        endpoint = new Endpoint({
+            authProvider: mockAuth,
+            port: 0,
+            cookieOptions: { secure: false },
+            allowedOrigins: ['https://app.example.com'],
+        });
+        endpoint.declare('agent');
+        endpoint.open();
+
+        const address = (endpoint as any).server?.address();
+        const port = typeof address === 'object' && address ? address.port : 3000;
+
+        const [upgradePromise, resolveUpgrade] = deal<{ statusCode: number }>();
+
+        const req = http.request({
+            port,
+            path: '/ws/agent',
+            agent: false,
+            headers: {
+                Connection: 'Upgrade',
+                Upgrade: 'websocket',
+                'Sec-WebSocket-Version': '13',
+                'Sec-WebSocket-Key': 'dGhlIHNhbXBsZSBub25jZQ==',
+                'x-token': 'valid-token',
+            },
+        });
+
+        req.on('upgrade', (res, socket) => {
+            resolveUpgrade({ statusCode: res.statusCode || 101 });
+            socket.destroy();
+        });
+
+        req.end();
+
+        const upgradeResult = await upgradePromise;
+        assert.strictEqual(upgradeResult.statusCode, 101);
+    });
+
+    it('rejects WebSocket upgrade when allowedOrigins is not configured and Origin is present', async () => {
+        endpoint = new Endpoint({
+            authProvider: mockAuth,
+            port: 0,
+            cookieOptions: { secure: false },
+        });
+        endpoint.declare('agent');
+        endpoint.open();
+
+        const address = (endpoint as any).server?.address();
+        const port = typeof address === 'object' && address ? address.port : 3000;
+
+        const [rejectPromise, resolveReject] = deal<{ statusCode: number }>();
+
+        const req = http.request({
+            port,
+            path: '/ws/agent',
+            agent: false,
+            headers: {
+                Connection: 'Upgrade',
+                Upgrade: 'websocket',
+                'Sec-WebSocket-Version': '13',
+                'Sec-WebSocket-Key': 'dGhlIHNhbXBsZSBub25jZQ==',
+                Origin: 'https://evil.com',
+                'x-token': 'valid-token',
+            },
+        });
+
+        req.on('response', (res) => {
+            resolveReject({ statusCode: res.statusCode || 403 });
+        });
+
+        req.on('upgrade', (_res, socket) => {
+            socket.destroy();
+            resolveReject({ statusCode: 101 });
+        });
+
+        req.end();
+
+        const rejectResult = await rejectPromise;
+        assert.strictEqual(rejectResult.statusCode, 403);
+    });
+
+    it('normalizes origin case and trailing slash when validating allowedOrigins', async () => {
+        endpoint = new Endpoint({
+            authProvider: mockAuth,
+            port: 0,
+            cookieOptions: { secure: false },
+            allowedOrigins: ['https://app.example.com/'],
+        });
+        endpoint.declare('agent');
+        endpoint.open();
+
+        const address = (endpoint as any).server?.address();
+        const port = typeof address === 'object' && address ? address.port : 3000;
+
+        const [upgradePromise, resolveUpgrade] = deal<{ statusCode: number }>();
+
+        const req = http.request({
+            port,
+            path: '/ws/agent',
+            agent: false,
+            headers: {
+                Connection: 'Upgrade',
+                Upgrade: 'websocket',
+                'Sec-WebSocket-Version': '13',
+                'Sec-WebSocket-Key': 'dGhlIHNhbXBsZSBub25jZQ==',
+                Origin: 'HTTPS://APP.EXAMPLE.COM',
+                'x-token': 'valid-token',
+            },
+        });
+
+        req.on('upgrade', (res, socket) => {
+            resolveUpgrade({ statusCode: res.statusCode || 101 });
+            socket.destroy();
+        });
+
+        req.end();
+
+        const upgradeResult = await upgradePromise;
+        assert.strictEqual(upgradeResult.statusCode, 101);
+    });
+
+    it('authenticates WebSocket upgrade via session cookie with allowed Origin', async () => {
+        endpoint = new Endpoint({
+            authProvider: mockAuth,
+            port: 0,
+            cookieOptions: { secure: false },
+            allowedOrigins: ['https://app.example.com'],
+        });
+        endpoint.declare('agent');
+        endpoint.open();
+
+        const authRes = await request(endpoint.express).post('/auth').send({ username: 'john' });
+        const cookie = authRes.headers['set-cookie']?.[0]?.split(';')[0];
+        assert.ok(cookie, 'Cookie must be set');
+
+        const address = (endpoint as any).server?.address();
+        const port = typeof address === 'object' && address ? address.port : 3000;
+
+        const [upgradePromise, resolveUpgrade] = deal<{ statusCode: number }>();
+
+        const req = http.request({
+            port,
+            path: '/ws/agent',
+            agent: false,
+            headers: {
+                Connection: 'Upgrade',
+                Upgrade: 'websocket',
+                'Sec-WebSocket-Version': '13',
+                'Sec-WebSocket-Key': 'dGhlIHNhbXBsZSBub25jZQ==',
+                Origin: 'https://app.example.com',
+                Cookie: cookie,
+            },
+        });
+
+        req.on('upgrade', (res, socket) => {
+            resolveUpgrade({ statusCode: res.statusCode || 101 });
+            socket.destroy();
+        });
+
+        req.end();
+
+        const upgradeResult = await upgradePromise;
+        assert.strictEqual(upgradeResult.statusCode, 101);
+    });
+
+    it('rejects WebSocket upgrade via session cookie with unauthorized Origin (cross-site WebSocket hijacking attempt)', async () => {
+        endpoint = new Endpoint({
+            authProvider: mockAuth,
+            port: 0,
+            cookieOptions: { secure: false },
+            allowedOrigins: ['https://app.example.com'],
+        });
+        endpoint.declare('agent');
+        endpoint.open();
+
+        const authRes = await request(endpoint.express).post('/auth').send({ username: 'john' });
+        const cookie = authRes.headers['set-cookie']?.[0]?.split(';')[0];
+        assert.ok(cookie);
+
+        const address = (endpoint as any).server?.address();
+        const port = typeof address === 'object' && address ? address.port : 3000;
+
+        const [rejectPromise, resolveReject] = deal<{ statusCode: number }>();
+
+        const req = http.request({
+            port,
+            path: '/ws/agent',
+            agent: false,
+            headers: {
+                Connection: 'Upgrade',
+                Upgrade: 'websocket',
+                'Sec-WebSocket-Version': '13',
+                'Sec-WebSocket-Key': 'dGhlIHNhbXBsZSBub25jZQ==',
+                Origin: 'https://attacker-hijack.com',
+                Cookie: cookie,
+            },
+        });
+
+        req.on('response', (res) => {
+            resolveReject({ statusCode: res.statusCode || 403 });
+        });
+
+        req.on('upgrade', (_res, socket) => {
+            socket.destroy();
+            resolveReject({ statusCode: 101 });
+        });
+
+        req.end();
+
+        const rejectResult = await rejectPromise;
+        assert.strictEqual(rejectResult.statusCode, 403);
+    });
+});
+
+describe('Endpoint CSRF Defense for Cookie-Authenticated Mutations', () => {
+    let mockAuth: AuthProvider;
+    let endpoint: Endpoint;
+    let tempDir: string;
+
+    beforeEach(() => {
+        tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'araminix-csrf-test-'));
+        mockAuth = {
+            getInfo: async (token: string) => {
+                if (token === 'valid-token') {
+                    return new Ok(new UserInfo('user-1', 'john', 'John Doe', 'rt-1', 'john@example.com', [], { _key: 'u1', name: 'Unit 1', code: 'U1' }));
+                }
+                return { isErr: () => true, isOk: () => false, unwrap: () => null } as any;
+            },
+            auth: async () => new Ok('valid-token'),
+            googleAuth: async () => new Ok('valid-token'),
+            destroy: async () => {},
+            refreshToken: async () => new Ok('valid-token'),
+            request2FA: async () => ({}) as any,
+            verify2FA: async () => new Ok('valid-token'),
+            enable2FA: async () => ({}) as any,
+            disable2FA: async () => ({}) as any,
+            requestUploadUrl: async () => ({}) as any,
+            requestDownloadUrl: async () => ({}) as any,
+            mobileRequests: async (req) => ({ status: 200, data: req.data }),
+        };
+    });
+
+    afterEach(() => {
+        if (endpoint) {
+            endpoint.close();
+        }
+        if (tempDir && fs.existsSync(tempDir)) {
+            fs.rmSync(tempDir, { recursive: true, force: true });
+        }
+    });
+
+    it('allows cookie-authenticated POST /mobile/:module/:action with Content-Type: application/json', async () => {
+        endpoint = new Endpoint({
+            authProvider: mockAuth,
+            port: 0,
+            cookieOptions: { secure: false },
+        });
+
+        const authRes = await request(endpoint.express).post('/auth').send({ username: 'john' });
+        const cookie = authRes.headers['set-cookie'];
+
+        const res = await request(endpoint.express).post('/mobile/system/restart').set('Cookie', cookie).set('Content-Type', 'application/json').send({ reason: 'maintenance' });
+
+        assert.strictEqual(res.status, 200);
+    });
+
+    it('allows cookie-authenticated POST /mobile/:module/:action with custom X-Requested-With header', async () => {
+        endpoint = new Endpoint({
+            authProvider: mockAuth,
+            port: 0,
+            cookieOptions: { secure: false },
+        });
+
+        const authRes = await request(endpoint.express).post('/auth').send({ username: 'john' });
+        const cookie = authRes.headers['set-cookie'];
+
+        const res = await request(endpoint.express)
+            .post('/mobile/system/restart')
+            .set('Cookie', cookie)
+            .set('X-Requested-With', 'XMLHttpRequest')
+            .set('Content-Type', 'application/x-www-form-urlencoded')
+            .send('reason=maintenance');
+
+        assert.strictEqual(res.status, 200);
+    });
+
+    it('rejects cookie-authenticated POST /mobile/:module/:action simple form request with 403 Forbidden', async () => {
+        endpoint = new Endpoint({
+            authProvider: mockAuth,
+            port: 0,
+            cookieOptions: { secure: false },
+        });
+
+        const authRes = await request(endpoint.express).post('/auth').send({ username: 'john' });
+        const cookie = authRes.headers['set-cookie'];
+
+        const res = await request(endpoint.express)
+            .post('/mobile/system/restart')
+            .set('Cookie', cookie)
+            .set('Content-Type', 'application/x-www-form-urlencoded')
+            .send('reason=malicious_cross_site_action');
+
+        assert.strictEqual(res.status, 403);
+        assert.ok(res.body.error || res.body.message);
+    });
+
+    it('rejects cookie-authenticated POST /mobile/:module/:action simple text/plain request with 403 Forbidden', async () => {
+        endpoint = new Endpoint({
+            authProvider: mockAuth,
+            port: 0,
+            cookieOptions: { secure: false },
+        });
+
+        const authRes = await request(endpoint.express).post('/auth').send({ username: 'john' });
+        const cookie = authRes.headers['set-cookie'];
+
+        const res = await request(endpoint.express).post('/mobile/system/restart').set('Cookie', cookie).set('Content-Type', 'text/plain').send('{"reason": "exploit"}');
+
+        assert.strictEqual(res.status, 403);
+    });
+
+    it('rejects cookie-authenticated POST /file simple request without custom headers with 403 Forbidden', async () => {
+        endpoint = new Endpoint({
+            authProvider: mockAuth,
+            uploadDir: tempDir,
+            port: 0,
+            cookieOptions: { secure: false },
+        });
+
+        const authRes = await request(endpoint.express).post('/auth').send({ username: 'john' });
+        const cookie = authRes.headers['set-cookie'];
+
+        const res = await request(endpoint.express).post('/file').set('Cookie', cookie).attach('file', Buffer.from('malicious payload'), 'exploit.txt');
+
+        assert.strictEqual(res.status, 403);
+    });
+
+    it('allows cookie-authenticated POST /file with X-Requested-With header', async () => {
+        endpoint = new Endpoint({
+            authProvider: mockAuth,
+            uploadDir: tempDir,
+            port: 0,
+            cookieOptions: { secure: false },
+        });
+
+        const authRes = await request(endpoint.express).post('/auth').send({ username: 'john' });
+        const cookie = authRes.headers['set-cookie'];
+
+        const res = await request(endpoint.express)
+            .post('/file')
+            .set('Cookie', cookie)
+            .set('X-Requested-With', 'XMLHttpRequest')
+            .attach('file', Buffer.from('valid file content'), 'upload.txt');
+
+        assert.strictEqual(res.status, 200);
+        assert.strictEqual(res.body.name, 'upload.txt');
+    });
+
+    it('allows header-authenticated (x-token) mutations without X-Requested-With or application/json', async () => {
+        endpoint = new Endpoint({
+            authProvider: mockAuth,
+            uploadDir: tempDir,
+            port: 0,
+        });
+
+        const resMobile = await request(endpoint.express)
+            .post('/mobile/system/restart')
+            .set('x-token', 'valid-token')
+            .set('Content-Type', 'application/x-www-form-urlencoded')
+            .send('reason=api_call');
+        assert.strictEqual(resMobile.status, 200);
+
+        const resUpload = await request(endpoint.express).post('/file').set('x-token', 'valid-token').attach('file', Buffer.from('api upload'), 'api.txt');
+        assert.strictEqual(resUpload.status, 200);
+    });
+
+    it('allows cookie-authenticated non-mutation GET requests without custom headers', async () => {
+        endpoint = new Endpoint({
+            authProvider: mockAuth,
+            uploadDir: tempDir,
+            port: 0,
+            cookieOptions: { secure: false },
+        });
+
+        const authRes = await request(endpoint.express).post('/auth').send({ username: 'john' });
+        const cookie = authRes.headers['set-cookie'];
+
+        const res = await request(endpoint.express).get('/file/non-existent-id').set('Cookie', cookie);
+
+        // Not blocked by CSRF 403, returns standard 404 for missing file
+        assert.strictEqual(res.status, 404);
     });
 });
