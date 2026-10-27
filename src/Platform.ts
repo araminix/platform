@@ -4,7 +4,7 @@ import AgentController from './agent/AgentController.js';
 import Instance from './executor/Instance.js';
 import { AppIndex, AppListing } from './lib/d.js';
 import { AuthProvider, ClientInfo, ClientType } from './server/AuthProvider.js';
-import Endpoint, { UploadAllowlist } from './server/Endpoint.js';
+import Endpoint, { RateLimitConfig, UploadAllowlist } from './server/Endpoint.js';
 
 export interface PlatformConfig {
     appIndexPath: URL;
@@ -20,6 +20,7 @@ export interface PlatformConfig {
     uploadAllowlist?: UploadAllowlist;
     googleClientIds?: string[];
     allowedOrigins?: string[];
+    authRateLimit?: RateLimitConfig | boolean;
     onCustomStream?: {
         [key: string]: (client: ClientInfo, stream: Stream) => Promise<void>;
     };
@@ -53,6 +54,7 @@ export default class Platform {
             uploadAllowlist: config.uploadAllowlist,
             googleClientIds: config.googleClientIds,
             allowedOrigins: config.allowedOrigins,
+            authRateLimit: config.authRateLimit,
         });
         this.agentController = new AgentController(this.config.agentIndexPath);
         this.serve();
@@ -169,6 +171,23 @@ export default class Platform {
         }
     }
 
+    private sanitizeClientInfo(clientInfo: ClientInfo): ClientInfo {
+        if (!clientInfo) return clientInfo;
+        const info = clientInfo as any;
+        if (info.settings && info.settings.two_factor) {
+            const sanitizedSettings = {
+                ...info.settings,
+                two_factor: {
+                    enabled: Boolean(info.settings.two_factor.enabled),
+                },
+            };
+            const sanitized = Object.create(Object.getPrototypeOf(clientInfo));
+            Object.assign(sanitized, clientInfo, { settings: sanitizedSettings });
+            return sanitized;
+        }
+        return clientInfo;
+    }
+
     processUserInfo(clientInfo: ClientInfo, endpointSocket: Socket): void {
         loop(async () => {
             const streamResult = await endpointSocket.incomingStream('clientInfo');
@@ -177,7 +196,8 @@ export default class Platform {
             }
             const stream = streamResult.unwrap();
             try {
-                const result = await stream.write(clientInfo);
+                const sanitizedClientInfo = this.sanitizeClientInfo(clientInfo);
+                const result = await stream.write(sanitizedClientInfo);
                 if (result.isErr()) {
                     stream.closeErr();
                 } else {

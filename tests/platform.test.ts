@@ -47,4 +47,50 @@ describe('Platform Core Structure', () => {
         assert.ok(platform.instances);
         platform.stop();
     });
+
+    it('passes authRateLimit configuration to Endpoint and sanitizes clientInfo', () => {
+        const mockAuth: AuthProvider = {
+            getInfo: async () => ({}) as any,
+            auth: async () => ({}) as any,
+            googleAuth: async () => ({}) as any,
+            destroy: async () => {},
+            refreshToken: async () => ({}) as any,
+            request2FA: async () => ({}) as any,
+            verify2FA: async () => ({}) as any,
+            enable2FA: async () => ({}) as any,
+            disable2FA: async () => ({}) as any,
+            requestUploadUrl: async () => ({}) as any,
+            requestDownloadUrl: async () => ({}) as any,
+            mobileRequests: async () => ({}) as any,
+        };
+
+        const platform = new Platform({
+            appIndexPath: new URL('file:///d:/dummy/apps.js'),
+            agentIndexPath: new URL('file:///d:/dummy/agents.js'),
+            authProvider: mockAuth,
+            instanceUserLimit: 5,
+            authRateLimit: { limit: 10, windowMs: 60000 },
+        });
+
+        assert.ok((platform.endpoint as any).authRateLimiter);
+
+        const rawClientInfo: any = {
+            id: 'u1',
+            settings: {
+                two_factor: {
+                    enabled: true,
+                    secret: 'LEAKED_SECRET',
+                    code: 'LEAKED_CODE',
+                },
+            },
+        };
+
+        const sanitized = (platform as any).sanitizeClientInfo(rawClientInfo);
+        assert.strictEqual(sanitized.settings.two_factor.enabled, true);
+        assert.strictEqual(sanitized.settings.two_factor.secret, undefined);
+        assert.strictEqual(sanitized.settings.two_factor.code, undefined);
+        assert.deepStrictEqual(sanitized.settings.two_factor, { enabled: true });
+
+        platform.stop();
+    });
 });

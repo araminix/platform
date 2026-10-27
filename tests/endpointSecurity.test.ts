@@ -1039,3 +1039,163 @@ describe('Endpoint CSRF Defense for Cookie-Authenticated Mutations', () => {
         assert.strictEqual(res.status, 404);
     });
 });
+
+describe('Endpoint Login and 2FA Hardening', () => {
+    let mockAuth: AuthProvider;
+    let endpoint: Endpoint;
+    let capturedDisable2FAArgs: { userId: string; code?: string } | undefined;
+    let disable2FAResult: any = new Ok(true);
+
+    beforeEach(() => {
+        capturedDisable2FAArgs = undefined;
+        disable2FAResult = new Ok(true);
+        mockAuth = {
+            getInfo: async (token: string) => {
+                if (token === 'valid-token') {
+                    return new Ok(
+                        new UserInfo('user-1', 'john', 'John Doe', 'rt-1', 'john@example.com', [], {
+                            _key: 'u1',
+                            name: 'Unit 1',
+                            code: 'U1',
+                        }),
+                    );
+                }
+                return { isErr: () => true, isOk: () => false, unwrap: () => null } as any;
+            },
+            auth: async (data: any) => {
+                if (data?.username === 'error-user') {
+                    return { isErr: () => true, isOk: () => false, e: 'invalid credentials' } as any;
+                }
+                return new Ok('session-token-123');
+            },
+            googleAuth: async () => new Ok('google-session-token'),
+            destroy: async () => {},
+            refreshToken: async () => new Ok('new-token-456'),
+            request2FA: async () => new Ok('server-generated-secret-xyz'),
+            verify2FA: async () => new Ok('verified-2fa-token'),
+            enable2FA: async () => new Ok(true),
+            disable2FA: async (userId: string, code?: string) => {
+                capturedDisable2FAArgs = { userId, code };
+                return disable2FAResult;
+            },
+            requestUploadUrl: async () => ({}) as any,
+            requestDownloadUrl: async () => ({}) as any,
+            mobileRequests: async () => ({}) as any,
+        };
+    });
+
+    afterEach(() => {
+        if (endpoint) {
+            endpoint.close();
+        }
+    });
+
+    it('enforces rate limiting on /auth keyed by IP and account', async () => {
+        endpoint = new Endpoint({
+            authProvider: mockAuth,
+            port: 0,
+            authRateLimit: { limit: 2, windowMs: 60000 },
+        });
+
+        const res1 = await request(endpoint.express).post('/auth').send({ username: 'userA' });
+        assert.strictEqual(res1.status, 200);
+
+        const res2 = await request(endpoint.express).post('/auth').send({ username: 'userA' });
+        assert.strictEqual(res2.status, 200);
+
+        const res3 = await request(endpoint.express).post('/auth').send({ username: 'userA' });
+        assert.strictEqual(res3.status, 429);
+        assert.strictEqual(res3.body.error, 'Too many requests');
+
+        // Different account on same IP has its own bucket
+        const resUserB = await request(endpoint.express).post('/auth').send({ username: 'userB' });
+        assert.strictEqual(resUserB.status, 200);
+    });
+
+    it('enforces rate limiting on /2fa/verify keyed by IP and account', async () => {
+        endpoint = new Endpoint({
+            authProvider: mockAuth,
+            port: 0,
+            authRateLimit: { limit: 2, windowMs: 60000 },
+        });
+
+        const payloadA = { accountName: 'userA', code: '123456', uuid: 'uuid-1' };
+        const res1 = await request(endpoint.express).post('/2fa/verify').send(payloadA);
+        assert.strictEqual(res1.status, 200);
+
+        const res2 = await request(endpoint.express).post('/2fa/verify').send(payloadA);
+        assert.strictEqual(res2.status, 200);
+
+        const res3 = await request(endpoint.express).post('/2fa/verify').send(payloadA);
+        assert.strictEqual(res3.status, 429);
+
+        // Different account on same IP is not throttled
+        const payloadB = { accountName: 'userB', code: '123456', uuid: 'uuid-1' };
+        const resUserB = await request(endpoint.express).post('/2fa/verify').send(payloadB);
+        assert.strictEqual(resUserB.status, 200);
+    });
+
+    it('enforces rate limiting on /auth/refresh keyed by IP and account', async () => {
+        endpoint = new Endpoint({
+            authProvider: mockAuth,
+            port: 0,
+            authRateLimit: { limit: 2, windowMs: 60000 },
+        });
+
+        const res1 = await request(endpoint.express).put('/auth/refresh').send({ old_token: 'tokenA' });
+        assert.strictEqual(res1.status, 200);
+
+        const res2 = await request(endpoint.express).put('/auth/refresh').send({ old_token: 'tokenA' });
+        assert.strictEqual(res2.status, 200);
+
+        const res3 = await request(endpoint.express).put('/auth/refresh').send({ old_token: 'tokenA' });
+        assert.strictEqual(res3.status, 429);
+
+        const resTokenB = await request(endpoint.express).put('/auth/refresh').send({ old_token: 'tokenB' });
+        assert.strictEqual(resTokenB.status, 200);
+    });
+
+    it('allows rate limiting to be disabled via authRateLimit: false', async () => {
+        endpoint = new Endpoint({
+            authProvider: mockAuth,
+            port: 0,
+            authRateLimit: false,
+        });
+
+        for (let i = 0; i < 5; i++) {
+            const res = await request(endpoint.express).post('/auth').send({ username: 'userA' });
+            assert.strictEqual(res.status, 200);
+        }
+    });
+
+    it('accepts optional code parameter on DELETE /2fa/disable from body or query', async () => {
+        endpoint = new Endpoint({
+            authProvider: mockAuth,
+            port: 0,
+        });
+
+        // 1. Without code
+        const resWithoutCode = await request(endpoint.express).delete('/2fa/disable').set('x-token', 'valid-token');
+        assert.strictEqual(resWithoutCode.status, 200);
+        assert.strictEqual(capturedDisable2FAArgs?.userId, 'user-1');
+        assert.strictEqual(capturedDisable2FAArgs?.code, undefined);
+
+        // 2. With code in JSON body
+        const resWithBodyCode = await request(endpoint.express).delete('/2fa/disable').set('x-token', 'valid-token').send({ code: '654321' });
+        assert.strictEqual(resWithBodyCode.status, 200);
+        assert.strictEqual(capturedDisable2FAArgs?.userId, 'user-1');
+        assert.strictEqual(capturedDisable2FAArgs?.code, '654321');
+
+        // 3. With code in query string
+        const resWithQueryCode = await request(endpoint.express).delete('/2fa/disable?code=987654').set('x-token', 'valid-token');
+        assert.strictEqual(resWithQueryCode.status, 200);
+        assert.strictEqual(capturedDisable2FAArgs?.userId, 'user-1');
+        assert.strictEqual(capturedDisable2FAArgs?.code, '987654');
+
+        // 4. When authProvider rejects disable2FA, returns 401
+        disable2FAResult = { isErr: () => true, isOk: () => false, e: 'Invalid 2FA code' };
+        const resFailed = await request(endpoint.express).delete('/2fa/disable').set('x-token', 'valid-token').send({ code: '000000' });
+        assert.strictEqual(resFailed.status, 401);
+        assert.strictEqual(resFailed.body.error, 'Invalid 2FA code');
+    });
+});

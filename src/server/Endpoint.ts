@@ -2,6 +2,7 @@ import { logger, Result, trimSlash, uuid, wrap, WsCloseCodes } from '@araminix/l
 import axios from 'axios';
 import cookieParser from 'cookie-parser';
 import expressCore, { CookieOptions, NextFunction, Request, Response } from 'express';
+import { ipKeyGenerator, rateLimit } from 'express-rate-limit';
 import expressWs from 'express-ws';
 import fs from 'fs';
 import type { Server } from 'http';
@@ -28,6 +29,15 @@ export interface UploadAllowlist {
     mimetypes?: string[];
 }
 
+export interface RateLimitConfig {
+    windowMs?: number;
+    max?: number;
+    limit?: number;
+    message?: any;
+    keyGenerator?: (req: Request, res: Response) => string | Promise<string>;
+    skipSuccessfulRequests?: boolean;
+}
+
 export interface EndpointOptions {
     authProvider: AuthProvider;
     port?: number;
@@ -42,6 +52,7 @@ export interface EndpointOptions {
     uploadAllowlist?: UploadAllowlist;
     googleClientIds?: string[];
     allowedOrigins?: string[];
+    authRateLimit?: RateLimitConfig | boolean;
 }
 
 function validateToken(req: CustomRequest, res: Response, next: NextFunction): void {
@@ -85,6 +96,8 @@ export default class Endpoint {
     private uploadAllowlist?: UploadAllowlist;
     private googleClientIds?: string[];
     private allowedOrigins?: string[];
+    private authRateLimit?: RateLimitConfig | boolean;
+    private authRateLimiter: any;
     readonly express: expressWs.Application;
     private server?: Server;
     private readonly connections: Map<string, unknown> = new Map();
@@ -105,6 +118,7 @@ export default class Endpoint {
         uploadAllowlist,
         googleClientIds,
         allowedOrigins,
+        authRateLimit,
     }: EndpointOptions) {
         this.authProvider = authProvider;
         this.port = port;
@@ -118,6 +132,35 @@ export default class Endpoint {
         this.uploadAllowlist = uploadAllowlist;
         this.googleClientIds = googleClientIds;
         this.allowedOrigins = allowedOrigins;
+        this.authRateLimit = authRateLimit;
+
+        const rateLimitEnabled = this.authRateLimit !== false;
+        if (rateLimitEnabled) {
+            const customConfig = typeof this.authRateLimit === 'object' ? this.authRateLimit : {};
+            this.authRateLimiter = rateLimit({
+                windowMs: customConfig.windowMs ?? 15 * 60 * 1000,
+                limit: customConfig.limit ?? customConfig.max ?? 100,
+                standardHeaders: true,
+                legacyHeaders: false,
+                validate: { xForwardedForHeader: false, default: false },
+                message: customConfig.message ?? {
+                    message: 'Too many authentication attempts, please try again later.',
+                    error: 'Too many requests',
+                },
+                keyGenerator:
+                    customConfig.keyGenerator ??
+                    ((req: Request) => {
+                        const rawIp = req.ip || req.socket?.remoteAddress || req.headers['x-forwarded-for'] || '127.0.0.1';
+                        const ip = ipKeyGenerator(typeof rawIp === 'string' ? rawIp : Array.isArray(rawIp) ? rawIp[0] : '127.0.0.1');
+                        const account = req.body?.accountName || req.body?.username || req.body?.email || req.body?.account || req.body?.old_token || '';
+                        return account ? `${ip}:${account}` : ip;
+                    }),
+                ...customConfig,
+            });
+        } else {
+            this.authRateLimiter = (_req: Request, _res: Response, next: NextFunction) => next();
+        }
+
         this.COOKIE_OPTIONS = {
             signed: true,
             httpOnly: true,
@@ -330,7 +373,7 @@ export default class Endpoint {
             res.status(200).json({ version: this.version }).end();
         });
 
-        this.express.post(`${this.mount}/auth`, async (req, res) => {
+        this.express.post(`${this.mount}/auth`, this.authRateLimiter, async (req, res) => {
             const result = await this.authProvider.auth(req.body);
             if (result.isErr()) {
                 logger.error('API Auth - Login Error: ', result.e);
@@ -346,7 +389,7 @@ export default class Endpoint {
         });
 
         // TODO (D6): Long-term improvement - have frontend send Google ID token and verify using google-auth-library
-        this.express.post(`${this.mount}/gauth`, async (req, res) => {
+        this.express.post(`${this.mount}/gauth`, this.authRateLimiter, async (req, res) => {
             if (!this.googleClientIds || this.googleClientIds.length === 0) {
                 logger.error('Google Auth Error: "googleClientIds" is not configured on Endpoint.');
                 res.status(503).send({ message: 'Google authentication is not configured on this server.' }).end();
@@ -452,7 +495,7 @@ export default class Endpoint {
             res.clearCookie('token', this.COOKIE_OPTIONS).status(200).send({ success: true }).end();
         });
 
-        this.express.put(`${this.mount}/auth/refresh`, async (req, res) => {
+        this.express.put(`${this.mount}/auth/refresh`, this.authRateLimiter, async (req, res) => {
             const result = await this.authProvider.refreshToken(req.body.old_token);
             if (result.isErr()) {
                 logger.error('API Auth - Refresh Token Error: ', result.e);
@@ -632,6 +675,14 @@ export default class Endpoint {
             }
         });
 
+        /**
+         * Enables 2FA for the authenticated user.
+         *
+         * SECURITY REQUIREMENT:
+         * The AuthProvider implementation MUST verify that the `secret` in the request body
+         * matches the secret that the server issued in `request2FA` for this user, rather than
+         * blindly accepting an arbitrary secret provided by the client.
+         */
         this.express.post(`${this.mount}/2fa/enable`, validateToken, async (req: CustomRequest, res) => {
             try {
                 const { code, secret } = req.body;
@@ -655,7 +706,7 @@ export default class Endpoint {
             }
         });
 
-        this.express.post(`${this.mount}/2fa/verify`, async (req, res) => {
+        this.express.post(`${this.mount}/2fa/verify`, this.authRateLimiter, async (req, res) => {
             try {
                 const { accountName, code, uuid: uuidCode } = req.body;
                 if (!accountName || !code || !uuidCode) {
@@ -681,7 +732,9 @@ export default class Endpoint {
 
         this.express.delete(`${this.mount}/2fa/disable`, validateToken, async (req: CustomRequest, res) => {
             try {
-                const result = await this.authProvider.disable2FA(req.info?.id ?? '');
+                const rawCode = req.body?.code ?? req.query?.code;
+                const code = rawCode !== undefined && rawCode !== null ? String(rawCode) : undefined;
+                const result = await this.authProvider.disable2FA(req.info?.id ?? '', code);
                 if (result.isErr()) {
                     logger.error('API Auth - 2FA Disable Error: ', result.e);
                     res.status(401).send({ error: result.e }).end();
