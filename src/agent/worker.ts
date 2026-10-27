@@ -59,6 +59,7 @@ if (parentPort) {
             resolve(new Ok(worker));
         } catch (e) {
             resolve(new Err(e as Error));
+            process.exit(1);
         }
     });
 
@@ -67,5 +68,8 @@ if (parentPort) {
         const worker = workerRes.unwrap();
         parentPort.postMessage('');
         await worker.run();
+        process.exit(0);
+    } else {
+        process.exit(1);
     }
 }

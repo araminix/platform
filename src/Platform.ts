@@ -444,6 +444,7 @@ export default class Platform {
             }
         }
         this.instances.clear();
+        this.agentController?.stop?.();
         this.endpoint.close();
     }
 }

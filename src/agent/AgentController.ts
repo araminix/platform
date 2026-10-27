@@ -13,7 +13,7 @@ export type AgentInit = {
     workerIndexPath: string;
 };
 
-class AgentInstance {
+export class AgentInstance {
     private workerIndex: URL;
     readonly info: AgentInfo;
     private worker?: Worker = undefined;
@@ -21,53 +21,92 @@ class AgentInstance {
     private responseSocket!: ResponseSocket;
     private socket?: Socket = undefined;
     private onDestroy?: () => void = undefined;
-    private timer: NodeJS.Timeout = setInterval(() => {
+    private timer?: NodeJS.Timeout = setInterval(() => {
         this.task('ping', '').then();
     }, 30000);
     private controller: AgentController;
+    private initTimeoutMs: number;
 
-    constructor(workerIndex: URL, info: AgentInfo, controller: AgentController) {
+    constructor(workerIndex: URL, info: AgentInfo, controller: AgentController, initTimeoutMs: number = 5000) {
         this.workerIndex = workerIndex;
         this.info = info;
         this.controller = controller;
+        this.initTimeoutMs = initTimeoutMs;
         if (this.timer && typeof this.timer.unref === 'function') {
             this.timer.unref();
         }
     }
 
-    async init(onDestroy: () => void): Promise<R> {
-        const requestChannel = new MessageChannel();
-        const responseChannel = new MessageChannel();
-        const workerInit: AgentInit = {
-            info: this.info,
-            responsePort: requestChannel.port2,
-            requestPort: responseChannel.port2,
-            workerIndexPath: this.workerIndex.href,
-        };
-        this.requestSocket = new RequestSocket(requestChannel.port1, deserialize);
-        this.responseSocket = new ResponseSocket(responseChannel.port1, deserialize);
-        this.worker = new Worker(new URL('./worker.js', import.meta.url));
-        const [promise, resolve] = deal<R>();
-        this.worker.postMessage(workerInit, [workerInit.requestPort, workerInit.responsePort]);
-        this.worker.on('message', () => {
-            resolve(ok());
-        });
-        this.worker.on('exit', () => {
-            resolve(err());
-        });
-        this.worker.on('error', (error: unknown) => {
-            if (error !== true) {
-                console.log('worker error', error);
+    async init(onDestroy: () => void, timeoutMs: number = this.initTimeoutMs): Promise<R> {
+        let timerId: NodeJS.Timeout | undefined = undefined;
+        try {
+            const requestChannel = new MessageChannel();
+            const responseChannel = new MessageChannel();
+            const workerInit: AgentInit = {
+                info: this.info,
+                responsePort: requestChannel.port2,
+                requestPort: responseChannel.port2,
+                workerIndexPath: this.workerIndex.href,
+            };
+            this.requestSocket = new RequestSocket(requestChannel.port1, deserialize);
+            this.responseSocket = new ResponseSocket(responseChannel.port1, deserialize);
+            this.worker = new Worker(new URL('./worker.js', import.meta.url));
+            const [promise, resolve] = deal<R>();
+            if (timeoutMs > 0) {
+                timerId = setTimeout(() => {
+                    resolve(err());
+                }, timeoutMs);
+                if (typeof timerId.unref === 'function') {
+                    timerId.unref();
+                }
             }
-            resolve(err());
-        });
-        const result = await promise;
-        if (result.isOk()) {
-            this.onDestroy = onDestroy;
-            this.run().then();
-            return result;
+            this.worker.postMessage(workerInit, [workerInit.requestPort, workerInit.responsePort]);
+            this.worker.on('message', () => {
+                resolve(ok());
+            });
+            this.worker.on('exit', () => {
+                resolve(err());
+            });
+            this.worker.on('error', (error: unknown) => {
+                if (error !== true) {
+                    console.log('worker error', error);
+                }
+                resolve(err());
+            });
+            const result = await promise;
+            if (timerId !== undefined) {
+                clearTimeout(timerId);
+                timerId = undefined;
+            }
+            if (result.isOk()) {
+                this.onDestroy = onDestroy;
+                this.run().then();
+                return result;
+            }
+        } catch (e) {
+            // failed
+        } finally {
+            if (timerId !== undefined) {
+                clearTimeout(timerId);
+                timerId = undefined;
+            }
         }
-        return result;
+        if (this.timer) {
+            clearInterval(this.timer);
+            this.timer = undefined;
+        }
+        if (this.worker) {
+            const worker = this.worker;
+            this.worker = undefined;
+            worker.terminate().catch(() => {});
+        }
+        try {
+            this.requestSocket?.close();
+        } catch {}
+        try {
+            this.responseSocket?.close();
+        } catch {}
+        return err();
     }
 
     async run(): Promise<void> {
@@ -189,14 +228,28 @@ class AgentInstance {
 
     destroy(): void {
         if (this.onDestroy) {
-            if (this.socket) {
-                this.socket.destroy();
-            }
-            this.onDestroy();
-            this.requestSocket.close();
-            this.responseSocket.close();
+            const cleanup = this.onDestroy;
             this.onDestroy = undefined;
+            cleanup();
+        }
+        if (this.socket) {
+            this.socket.destroy();
+            this.socket = undefined;
+        }
+        try {
+            this.requestSocket?.close();
+        } catch {}
+        try {
+            this.responseSocket?.close();
+        } catch {}
+        if (this.timer) {
             clearInterval(this.timer);
+            this.timer = undefined;
+        }
+        if (this.worker) {
+            const worker = this.worker;
+            this.worker = undefined;
+            worker.terminate().catch(() => {});
         }
     }
 }
@@ -204,9 +257,12 @@ class AgentInstance {
 export default class AgentController {
     private workerIndex: URL;
     private instances: Map<string, AgentInstance> = new Map();
+    private pending: Map<string, Promise<R>> = new Map();
+    private initTimeoutMs: number;
 
-    constructor(workerIndex: URL) {
+    constructor(workerIndex: URL, initTimeoutMs: number = 5000) {
         this.workerIndex = workerIndex;
+        this.initTimeoutMs = initTimeoutMs;
     }
 
     async task(id: string, taskName: string, data: t.Any | unknown, hp: number): Promise<Result<any, undefined>> {
@@ -229,19 +285,45 @@ export default class AgentController {
         return err();
     }
 
-    async connect(info: AgentInfo, acceptRequest: ConnectRequest): Promise<R> {
+    async connect(info: AgentInfo, acceptRequest: ConnectRequest, timeoutMs?: number): Promise<R> {
+        const pendingInit = this.pending.get(info.id);
+        if (pendingInit) {
+            try {
+                const result = await pendingInit;
+                if (result.isErr()) {
+                    this.instances.delete(info.id);
+                    acceptRequest.deny();
+                    return result;
+                }
+            } catch {
+                this.instances.delete(info.id);
+                acceptRequest.deny();
+                return err();
+            }
+        }
+
         let worker = this.instances.get(info.id);
         if (worker && worker.info.agentType !== info.agentType) {
             worker.destroy();
             worker = undefined;
         }
         if (!worker) {
-            worker = new AgentInstance(this.workerIndex, info, this);
+            worker = new AgentInstance(this.workerIndex, info, this, timeoutMs ?? this.initTimeoutMs);
             this.instances.set(info.id, worker);
-            const result = await worker.init(() => {
+            const initPromise = worker.init(() => {
                 this.instances.delete(info.id);
-            });
+            }, timeoutMs ?? this.initTimeoutMs);
+            this.pending.set(info.id, initPromise);
+            let result: R;
+            try {
+                result = await initPromise;
+            } catch {
+                result = err();
+            } finally {
+                this.pending.delete(info.id);
+            }
             if (result.isErr()) {
+                this.instances.delete(info.id);
                 acceptRequest.deny();
                 return result;
             }
@@ -252,5 +334,13 @@ export default class AgentController {
         }
         worker.connect(socket.unwrap());
         return ok();
+    }
+
+    stop(): void {
+        for (const instance of [...this.instances.values()]) {
+            instance.destroy();
+        }
+        this.instances.clear();
+        this.pending.clear();
     }
 }
