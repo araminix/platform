@@ -18,6 +18,7 @@ export interface PlatformConfig {
     uploadDir?: string;
     maxUploadBytes?: number;
     uploadAllowlist?: UploadAllowlist;
+    googleClientIds?: string[];
     onCustomStream?: {
         [key: string]: (client: ClientInfo, stream: Stream) => Promise<void>;
     };
@@ -49,6 +50,7 @@ export default class Platform {
             uploadDir: config.uploadDir,
             maxUploadBytes: config.maxUploadBytes,
             uploadAllowlist: config.uploadAllowlist,
+            googleClientIds: config.googleClientIds,
         });
         this.agentController = new AgentController(this.config.agentIndexPath);
         this.serve();

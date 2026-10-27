@@ -197,6 +197,25 @@ const endpoint = new Endpoint({
 - **`/ws-token/:token/:endpoint` (`@deprecated`):**
     - Maintained for backward compatibility with legacy clients. Tokens in URL paths are automatically redacted in server access logs.
 
+#### Google OAuth Hardening (`/gauth`)
+
+`Endpoint` verifies Google access tokens against Google's `tokeninfo` endpoint prior to retrieving user profile data:
+
+- **Client ID Verification:** `EndpointOptions.googleClientIds` defines allowed OAuth client IDs. Replayed tokens issued to other Google OAuth applications are rejected with HTTP 401 (`Unauthorized`).
+- **Verified Email Enforcement:** Rejects tokens unless Google confirms `email_verified === 'true'`.
+- **Header-Only Authorization:** Access tokens are passed to `userinfo` strictly via the HTTP `Authorization: Bearer <token>` header rather than query strings.
+- **Fail-Closed Protection:** If `googleClientIds` is not configured, `/gauth` requests are refused with HTTP 503 (`Service Unavailable`).
+- **HTTP Timeouts:** All external Google API calls enforce an explicit 10-second timeout.
+
+```typescript
+const endpoint = new Endpoint({
+    authProvider: new CustomAuthProvider(),
+    googleClientIds: [
+        '1234567890-example.apps.googleusercontent.com',
+    ],
+});
+```
+
 ---
 
 ### 5. File Upload Security & Stored XSS Mitigation

@@ -40,6 +40,7 @@ export interface EndpointOptions {
     cookieOptions?: CookieOptions;
     maxUploadBytes?: number;
     uploadAllowlist?: UploadAllowlist;
+    googleClientIds?: string[];
 }
 
 function validateToken(req: CustomRequest, res: Response, next: NextFunction): void {
@@ -61,6 +62,7 @@ export default class Endpoint {
     private minio?: MinioOptions | void;
     private maxUploadBytes: number;
     private uploadAllowlist?: UploadAllowlist;
+    private googleClientIds?: string[];
     readonly express: expressWs.Application;
     private server?: Server;
     private readonly connections: Map<string, unknown> = new Map();
@@ -79,6 +81,7 @@ export default class Endpoint {
         cookieOptions,
         maxUploadBytes = 20 * 1024 * 1024,
         uploadAllowlist,
+        googleClientIds,
     }: EndpointOptions) {
         this.authProvider = authProvider;
         this.port = port;
@@ -90,6 +93,7 @@ export default class Endpoint {
         this.minio = minio;
         this.maxUploadBytes = maxUploadBytes;
         this.uploadAllowlist = uploadAllowlist;
+        this.googleClientIds = googleClientIds;
         this.COOKIE_OPTIONS = {
             signed: true,
             httpOnly: true,
@@ -270,30 +274,86 @@ export default class Endpoint {
             }
         });
 
+        // TODO (D6): Long-term improvement - have frontend send Google ID token and verify using google-auth-library
         this.express.post(`${this.mount}/gauth`, async (req, res) => {
-            const access_token = req.body.access_token;
-            if (!access_token) {
+            if (!this.googleClientIds || this.googleClientIds.length === 0) {
+                logger.error('Google Auth Error: "googleClientIds" is not configured on Endpoint.');
+                res.status(503).send({ message: 'Google authentication is not configured on this server.' }).end();
+                return;
+            }
+
+            const access_token = req.body?.access_token;
+            if (!access_token || typeof access_token !== 'string') {
                 logger.error('Google Auth Validation Error: "access_token" is required in body.');
                 res.status(422).send({ message: '"access_token" is required in body.' }).end();
                 return;
             }
-            const result = await wrap<any>(
-                axios.get(`https://www.googleapis.com/oauth2/v1/userinfo?access_token=${access_token}`, {
-                    headers: { Authorization: `Bearer ${access_token}`, Accept: 'application/json' },
+
+            const tokenInfoResult = await wrap<any>(
+                axios.get(`https://oauth2.googleapis.com/tokeninfo?access_token=${encodeURIComponent(access_token)}`, {
+                    timeout: 10000,
                 }),
             );
-            if (result.isErr()) {
-                logger.error('Google Auth API Error: ', result.e);
-                res.status(401).send({ error: result.e }).end();
+            if (tokenInfoResult.isErr()) {
+                logger.error('Google Auth Token Info Error: ', tokenInfoResult.e);
+                res.status(401).send({ error: tokenInfoResult.e }).end();
                 return;
             }
-            const authResponse = result.unwrap();
+            const tokenInfoResponse = tokenInfoResult.unwrap();
+            if (tokenInfoResponse.status !== 200 || !tokenInfoResponse.data) {
+                logger.error('Google Auth Token Info Status not 200: ', tokenInfoResponse.data);
+                res.status(401).send({ error: tokenInfoResponse.data }).end();
+                return;
+            }
+
+            const tokenData = tokenInfoResponse.data;
+            const isAudValid = typeof tokenData.aud === 'string' && this.googleClientIds.includes(tokenData.aud);
+            const isAzpValid = typeof tokenData.azp === 'string' && this.googleClientIds.includes(tokenData.azp);
+            const isClientAuthorized = isAudValid || isAzpValid;
+            const isEmailVerified = tokenData.email_verified === 'true' || tokenData.email_verified === true;
+
+            if (!isClientAuthorized || !isEmailVerified) {
+                logger.error('Google Auth Token Verification Failed: token not issued for configured client or email not verified.', {
+                    aud: tokenData.aud,
+                    azp: tokenData.azp,
+                    email_verified: tokenData.email_verified,
+                });
+                res.status(401).send({ error: 'Unauthorized Google token: client ID mismatch or email not verified.' }).end();
+                return;
+            }
+
+            const userInfoResult = await wrap<any>(
+                axios.get('https://www.googleapis.com/oauth2/v1/userinfo', {
+                    headers: { Authorization: `Bearer ${access_token}`, Accept: 'application/json' },
+                    timeout: 10000,
+                }),
+            );
+            if (userInfoResult.isErr()) {
+                logger.error('Google Auth API Error: ', userInfoResult.e);
+                res.status(401).send({ error: userInfoResult.e }).end();
+                return;
+            }
+            const authResponse = userInfoResult.unwrap();
             if (authResponse.status !== 200) {
                 logger.error('Google Auth Status not 200: ', authResponse.data);
                 res.status(401).send({ error: authResponse.data }).end();
                 return;
             }
             const googleData = authResponse.data;
+            if ((googleData as any)?.verified_email === false) {
+                logger.error('Google Auth UserInfo Verification Error: email is not verified.', googleData);
+                res.status(401).send({ error: 'Google email is not verified.' }).end();
+                return;
+            }
+            if (tokenData.email && googleData?.email && tokenData.email.toLowerCase() !== googleData.email.toLowerCase()) {
+                logger.error('Google Auth Verification Error: tokeninfo email does not match userinfo email.', {
+                    tokenEmail: tokenData.email,
+                    userEmail: googleData.email,
+                });
+                res.status(401).send({ error: 'Google token email does not match userinfo.' }).end();
+                return;
+            }
+
             if (GoogleData.is(googleData)) {
                 const authRes = await this.authProvider.googleAuth(googleData);
                 if (authRes.isErr()) {
