@@ -1,3 +1,12 @@
+/**
+ * Entry file of agent worker threads (one per connected agent id), started by `AgentInstance.init`.
+ *
+ * It waits for the `AgentInit` message, imports the agent index, creates the agent of the requested type, answers with an
+ * empty message to signal readiness and then serves `AgentPost` requests until its port closes. The process exits with
+ * code 1 when the index cannot be loaded or the type does not exist.
+ *
+ * @module
+ */
 import { deal, Err, logger, Ok, Result } from '@araminix/lib';
 import { parentPort } from 'worker_threads';
 
@@ -6,17 +15,30 @@ import { RequestSocket, ResponseSocket } from '../lib/worker_socket.js';
 import { initAgentWorkerDriver } from './agentWorkerDriver.js';
 import { Agent, AgentFactory, AgentIndex } from './d.js';
 
+/** Serves the requests of the main thread for one agent. */
 class AgentWorker {
+    /** The agent object. */
     private agent: Agent<any>;
+    /** Requests from this worker to the main thread. */
     private requestSocket: RequestSocket;
+    /** Requests from the main thread to this worker. */
     private responseSocket: ResponseSocket;
 
+    /**
+     * @param agent - The agent object.
+     * @param requestSocket - Requests to the main thread.
+     * @param responseSocket - Requests from the main thread.
+     */
     constructor(agent: Agent<any>, requestSocket: RequestSocket, responseSocket: ResponseSocket) {
         this.agent = agent;
         this.requestSocket = requestSocket;
         this.responseSocket = responseSocket;
     }
 
+    /**
+     * Answers `AgentPost` requests with the serialised result of {@link Agent.onPost} (a thrown error becomes
+     * `Err(message)`) until the port closes, then closes the request socket.
+     */
     async run(): Promise<void> {
         while (true) {
             const requestResult = await this.responseSocket.read();
@@ -48,6 +70,7 @@ class AgentWorker {
     }
 }
 
+/** Bootstrap: runs only inside a worker thread. */
 if (parentPort) {
     const [promise, resolve] = deal<Result<AgentWorker, Error>>();
     parentPort.on('message', async (init: any) => {

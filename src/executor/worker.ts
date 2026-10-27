@@ -1,3 +1,11 @@
+/**
+ * Entry file of app worker threads (one per app instance), started by `Instance.init`.
+ *
+ * It waits for the `WorkerInit` message, imports the app index, finds the app by name, installs the worker and agent
+ * drivers, reports the app title to the main thread and then serves requests until its channel closes.
+ *
+ * @module
+ */
 import { logger } from '@araminix/lib';
 import { parentPort } from 'worker_threads';
 
@@ -8,13 +16,26 @@ import { AppInstance } from './AppInstance.js';
 import { Action, Close, Data, deserialize, Load, Other, Prev, Query, Refresh, Reload, Switch } from './proto.js';
 import { initWorkerDriver } from './workerDriver.js';
 
+/** Serves the main thread's requests for one app instance. */
 class Worker {
+    /** Requests to the main thread. */
     private requestSocket: RequestSocket;
+    /** Requests from the main thread. */
     private responseSocket: ResponseSocket;
+    /** Owner of the instance. */
     private userId: string;
+    /** Activity limit. */
     private tabLimit: number;
+    /** The running app. */
     private app: AppInstance;
 
+    /**
+     * @param requestSocket - Requests to the main thread.
+     * @param responseSocket - Requests from the main thread.
+     * @param app - The app to run.
+     * @param userId - Owner of the instance.
+     * @param tabLimit - Activity limit.
+     */
     constructor(requestSocket: RequestSocket, responseSocket: ResponseSocket, app: App<any, any>, userId: string, tabLimit: number) {
         this.requestSocket = requestSocket;
         this.responseSocket = responseSocket;
@@ -23,6 +44,10 @@ class Worker {
         this.app = new AppInstance(app, this.tabLimit);
     }
 
+    /**
+     * Opens the main page, then handles requests one at a time under the app lock until the channel closes. An exception in
+     * app code fails that request with {@link Other} and the instance keeps serving.
+     */
     async run(): Promise<void> {
         await this.app.exclusive(() => this.app.init());
         while (true) {
@@ -45,6 +70,7 @@ class Worker {
         }
     }
 
+    /** Dispatches one request to the {@link AppInstance} and answers it. */
     private async handle(request: Req): Promise<void> {
         switch (true) {
             case request instanceof Reload: {
@@ -131,6 +157,7 @@ class Worker {
     }
 }
 
+/** Bootstrap: runs only inside a worker thread. */
 if (parentPort) {
     const init = await new Promise<any>((res, rej) => {
         let resolved = false;

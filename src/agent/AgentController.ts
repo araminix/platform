@@ -6,28 +6,58 @@ import { RequestSocket, ResponseSocket } from '../lib/worker_socket.js';
 import { AgentInfo } from '../server/AuthProvider.js';
 import { ConnectRequest } from '../server/ConnectRequest.js';
 
+/** First message sent to an agent worker thread. */
 export type AgentInit = {
+    /** Identity of the agent. */
     info: AgentInfo;
+    /** Port on which the worker receives requests from the main thread. */
     responsePort: MessagePort;
+    /** Port on which the worker sends requests to the main thread. */
     requestPort: MessagePort;
+    /** URL of the agent index module. */
     workerIndexPath: string;
 };
 
+/**
+ * One connected agent in the main thread: its worker thread, the ports to it, the agent's WebSocket and a keep-alive
+ * that sends a `ping` task every 30 seconds while a socket is attached.
+ *
+ * The instance outlives disconnects so that a reconnecting agent finds its worker again; it is destroyed when the agent
+ * closes its connection intentionally, when its worker stops, or by {@link AgentController.stop}.
+ */
 export class AgentInstance {
+    /** URL of the agent index module. */
     private workerIndex: URL;
+    /** Identity of the agent. */
     readonly info: AgentInfo;
+    /** The agent's worker thread. */
     private worker?: Worker = undefined;
+    /** Requests to the worker (`AgentPost`). */
     private requestSocket!: RequestSocket;
+    /** Requests from the worker (tasks, lists, acquires). */
     private responseSocket!: ResponseSocket;
+    /** The agent's current WebSocket session, if connected. */
     private socket?: Socket = undefined;
+    /** Removes the instance from the controller. */
     private onDestroy?: () => void = undefined;
+    /** Keep-alive timer (unref'd). */
     private timer?: NodeJS.Timeout = setInterval(() => {
         this.task('ping', '').then();
     }, 30000);
+    /** Owning controller (routes the worker's requests). */
     private controller: AgentController;
+    /** Default worker start-up timeout. */
     private initTimeoutMs: number;
+    /** Timeout of requests to the worker. */
     private requestTimeoutMs: number;
 
+    /**
+     * @param workerIndex - URL of the agent index module.
+     * @param info - Identity of the agent.
+     * @param controller - Owning controller.
+     * @param initTimeoutMs - Worker start-up timeout in milliseconds (default 5000).
+     * @param requestTimeoutMs - Timeout of requests to the worker in milliseconds (default 0 = none).
+     */
     constructor(workerIndex: URL, info: AgentInfo, controller: AgentController, initTimeoutMs: number = 5000, requestTimeoutMs: number = 0) {
         this.workerIndex = workerIndex;
         this.info = info;
@@ -39,6 +69,14 @@ export class AgentInstance {
         }
     }
 
+    /**
+     * Starts the worker thread and waits until it reports ready. On failure (exit, error or timeout) it terminates the
+     * worker, stops the keep-alive and closes the ports.
+     *
+     * @param onDestroy - Called once when the instance is destroyed later.
+     * @param timeoutMs - Start-up timeout in milliseconds; `0` disables it.
+     * @returns `Ok` when the worker is ready, `Err` otherwise.
+     */
     async init(onDestroy: () => void, timeoutMs: number = this.initTimeoutMs): Promise<R> {
         let timerId: NodeJS.Timeout | undefined = undefined;
         try {
@@ -111,6 +149,7 @@ export class AgentInstance {
         return err();
     }
 
+    /** Serves the worker's requests (`AgentTask`, `AgentList`, `AcquireAgent`) until its port closes, then destroys the instance. */
     async run(): Promise<void> {
         while (true) {
             const result = await this.responseSocket.read();
@@ -153,6 +192,16 @@ export class AgentInstance {
         this.destroy();
     }
 
+    /**
+     * Sends a task to the agent process: opens the outgoing stream `taskName` with `data` as arguments, reads one reply and
+     * closes the stream.
+     *
+     * @param taskName - Stream name.
+     * @param data - Stream arguments.
+     * @param hp - Reply timeout in seconds (lib stream "hit points"); the lib default (30) when omitted.
+     * @returns The raw reply (an object with an `ok` field), or `Err(undefined)` when the agent is not connected, the stream
+     *     fails, times out or the reply is malformed.
+     */
     async task<TData = unknown, R = unknown>(taskName: string, data: TData, hp?: number): Promise<Result<R, undefined>> {
         if (!this.socket) {
             return new Err(undefined);
@@ -176,6 +225,13 @@ export class AgentInstance {
         return new Ok(result as R);
     }
 
+    /**
+     * Attaches the agent's (new) socket, destroying the previous one, and serves its `post` streams (`{ name, data }`
+     * arguments, forwarded to {@link Agent.onPost}). When the socket closes intentionally the instance is destroyed;
+     * otherwise it waits for a reconnect.
+     *
+     * @param socket - The accepted socket.
+     */
     connect(socket: Socket): void {
         if (this.socket !== undefined) {
             this.socket.destroy();
@@ -228,6 +284,7 @@ export class AgentInstance {
         });
     }
 
+    /** Removes the instance from the controller and releases the socket, ports, keep-alive timer and worker. Idempotent. */
     destroy(): void {
         if (this.onDestroy) {
             const cleanup = this.onDestroy;
@@ -256,19 +313,44 @@ export class AgentInstance {
     }
 }
 
+/**
+ * Runs the agents in the main thread: one {@link AgentInstance} (and worker thread) per connected agent id, and the
+ * routing of tasks, lists and acquires between app workers, agent workers and agent processes. Created by
+ * {@link Platform}; not exported from the package.
+ */
 export default class AgentController {
+    /** URL of the agent index module. */
     private workerIndex: URL;
+    /** Agents by id. */
     private instances: Map<string, AgentInstance> = new Map();
+    /** Worker start-ups in progress by agent id, shared by concurrent connects. */
     private pending: Map<string, Promise<R>> = new Map();
+    /** Worker start-up timeout in milliseconds. */
     private initTimeoutMs: number;
+    /** Timeout of requests to agent workers in milliseconds. */
     private requestTimeoutMs: number;
 
+    /**
+     * @param workerIndex - URL of the agent index module ({@link PlatformConfig.agentIndexPath}).
+     * @param initTimeoutMs - Worker start-up timeout in milliseconds (default 5000).
+     * @param requestTimeoutMs - Timeout of requests to agent workers in milliseconds (default 0 = none; Platform passes
+     *     `workerRequestTimeoutMs`).
+     */
     constructor(workerIndex: URL, initTimeoutMs: number = 5000, requestTimeoutMs: number = 0) {
         this.workerIndex = workerIndex;
         this.initTimeoutMs = initTimeoutMs;
         this.requestTimeoutMs = requestTimeoutMs;
     }
 
+    /**
+     * Sends a task to the agent `id` (see {@link AgentInstance.task}).
+     *
+     * @param id - Agent id.
+     * @param taskName - Task (stream) name.
+     * @param data - Task data.
+     * @param hp - Reply timeout in seconds.
+     * @returns The raw reply, or `Err(undefined)` when the agent is unknown or did not answer.
+     */
     async task(id: string, taskName: string, data: t.Any | unknown, hp: number): Promise<Result<any, undefined>> {
         const worker = this.instances.get(id);
         if (!worker) {
@@ -277,10 +359,21 @@ export default class AgentController {
         return await worker.task(taskName, data, hp);
     }
 
+    /**
+     * Ids of the known agents of a type.
+     *
+     * @param type - Agent type.
+     */
     list(type: string): string[] {
         return [...this.instances.values()].filter((instance) => instance.info.agentType === type).map((instance) => instance.info.id);
     }
 
+    /**
+     * Checks that agent `id` is known and of type `type`.
+     *
+     * @param type - Agent type.
+     * @param id - Agent id.
+     */
     acquire(type: string, id: string): R {
         const agent = this.instances.get(id);
         if (agent && agent.info.agentType === type) {
@@ -289,6 +382,16 @@ export default class AgentController {
         return err();
     }
 
+    /**
+     * Admits an agent connection: starts its worker if needed (concurrent connects of the same id share one start-up; a
+     * worker of a different type is replaced), then accepts the request and attaches the socket. The request is denied when
+     * the worker cannot start.
+     *
+     * @param info - Identity of the agent.
+     * @param acceptRequest - The pending connection.
+     * @param timeoutMs - Start-up timeout in milliseconds; the controller default when omitted.
+     * @returns `Ok` when the agent is connected, `Err` otherwise.
+     */
     async connect(info: AgentInfo, acceptRequest: ConnectRequest, timeoutMs?: number): Promise<R> {
         const pendingInit = this.pending.get(info.id);
         if (pendingInit) {
@@ -340,6 +443,7 @@ export default class AgentController {
         return ok();
     }
 
+    /** Destroys every agent instance and its worker. */
     stop(): void {
         for (const instance of [...this.instances.values()]) {
             instance.destroy();

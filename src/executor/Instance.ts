@@ -24,40 +24,90 @@ import {
     WorkerInit,
 } from './proto.js';
 
+/** Lifecycle of an {@link Instance}. */
 enum Status {
+    /** Constructed, worker not started. */
     Created = 0,
+    /** Worker starting. */
     Initiating = 1,
+    /** Worker ready, requests are served. */
     Initiated = 2,
+    /** Torn down; final. */
     Destroyed = 3,
 }
 
+/** Error codes the client receives (serialised as `{ ok: false, e }`) on the instance streams. */
 enum IncomingStreamErr {
+    /** The stream arguments have the wrong shape. */
     Format = 'Format',
+    /** The worker is not ready, rejected the request or did not answer in time. */
     Execution = 'Execution',
 }
 
+/**
+ * One running app instance, seen from the main thread: an app worker thread, the two IPC channels to it, and the user's
+ * WebSocket on the `instance` endpoint.
+ *
+ * {@link Platform} creates it for a `createInstance` request, starts it with {@link Instance.init} and attaches the
+ * client socket with {@link Instance.connect} when the client opens `/ws/instance/<instance id>`. The client then sends
+ * requests on the streams `load`, `reload`, `prev`, `close`, `switch`, `action`, `query` and `refresh`, each forwarded to
+ * the worker; the worker's output reaches the client as outgoing streams `activityList`, `build`, `push` and
+ * `update-<fragmentId>`. Not exported from the package.
+ */
 export default class Instance {
+    /** Owner of the instance ({@link ClientInfo.id}). */
     readonly userId: string;
+    /** Name of the app that runs. */
     readonly appName: string;
+    /** Launch profile, or `null`. */
     readonly profile: string | null;
+    /** URL of the app index module, imported by the worker. */
     readonly appIndexPath: URL;
+    /** Activity limit passed to the worker. */
     readonly tabLimit: number;
+    /** Routes the worker's agent requests. */
     readonly agentController: AgentController;
+    /** Worker resource limits; `{ maxOldGenerationSizeMb: 128, stackSizeMb: 4 }` when unset. */
     readonly resourceLimits?: ResourceLimits;
+    /** Time the worker gets to exit on its own after {@link Instance.destroy} before it is terminated. */
     readonly terminationGracePeriodMs: number;
+    /** Timeout of requests to the worker in milliseconds (0 = none). */
     readonly requestTimeoutMs: number;
+    /** The app worker thread. */
     private worker?: Worker = undefined;
+    /** Requests to the worker. */
     private requestSocket?: RequestSocket = undefined;
+    /** Requests from the worker. */
     private responseSocket?: ResponseSocket = undefined;
+    /** Lifecycle state. */
     private status: Status = Status.Created;
+    /** Random instance id; the client connects to `/ws/instance/<id>` and closes it with `closeInstance`. */
     readonly id: string = uuid();
+    /** App title reported by the worker when it started. */
     appTitle: string = '';
+    /** Title of the active activity, from the last activity list. */
     activityTitle?: string = undefined;
+    /** Removes the instance from the platform's map; run once. */
     private onDestroy?: () => void = undefined;
+    /** Last use timestamp (ms). */
     private _touched: number = Date.now();
+    /** The client's current socket. */
     private userSocket?: Socket = undefined;
+    /** Pending forced termination of the worker. */
     private terminationTimer?: NodeJS.Timeout = undefined;
 
+    /**
+     * @param userId - Owner of the instance.
+     * @param appName - App to run.
+     * @param profile - Launch profile, or `null`.
+     * @param appIndexPath - URL of the app index module.
+     * @param tabLimit - Activity limit.
+     * @param agentController - Agent router.
+     * @param resourceLimits - Worker resource limits (default 128 MB old generation, 4 MB stack).
+     * @param terminationGracePeriodMs - Grace period before the worker is terminated on destroy (default 500 ms).
+     * @param requestTimeoutMs - Timeout of requests to the worker (default 0 = none; Platform passes
+     *     `workerRequestTimeoutMs`).
+     */
     constructor(
         userId: string,
         appName: string,
@@ -80,18 +130,30 @@ export default class Instance {
         this.requestTimeoutMs = requestTimeoutMs;
     }
 
+    /** Whether {@link Instance.destroy} ran. */
     get isDestroyed(): boolean {
         return this.status === Status.Destroyed;
     }
 
+    /** Last use timestamp in milliseconds; {@link Platform} evicts the least recently touched instance first. */
     get touched(): number {
         return this._touched;
     }
 
+    /**
+     * Marks the instance as used (called when a client socket connects).
+     *
+     * @param time - Timestamp in milliseconds; now by default.
+     */
     touch(time: number = Date.now()): void {
         this._touched = time;
     }
 
+    /**
+     * Attaches the client's socket (destroying a previous one) and serves its request streams until it closes.
+     *
+     * @param socket - The accepted socket of the `instance` endpoint.
+     */
     connect(socket: Socket): void {
         this.touch();
         if (this.userSocket) {
@@ -130,6 +192,7 @@ export default class Instance {
         });
     }
 
+    /** `load` stream: asks the worker to send the active activity's build. */
     private async load(): Promise<Result<void, IncomingStreamErr>> {
         if (!this.requestSocket) {
             return new Err(IncomingStreamErr.Execution);
@@ -141,6 +204,7 @@ export default class Instance {
         return ok();
     }
 
+    /** `reload` stream (args: activity id): re-render the active activity. */
     private async reload(args: unknown): Promise<Result<void, IncomingStreamErr>> {
         if (typeof args !== 'string') {
             return new Err(IncomingStreamErr.Format);
@@ -155,6 +219,7 @@ export default class Instance {
         return ok();
     }
 
+    /** `prev` stream (args: activity id): go back. */
     private async prev(args: unknown): Promise<Result<void, IncomingStreamErr>> {
         if (typeof args !== 'string') {
             return new Err(IncomingStreamErr.Format);
@@ -169,6 +234,7 @@ export default class Instance {
         return ok();
     }
 
+    /** `close` stream (args: activity id): the user closes an activity. */
     private async close(args: unknown): Promise<Result<void, IncomingStreamErr>> {
         if (typeof args !== 'string') {
             return new Err(IncomingStreamErr.Format);
@@ -183,6 +249,7 @@ export default class Instance {
         return ok();
     }
 
+    /** `switch` stream (args: activity id): activate another activity. */
     private async switchActive(args: unknown): Promise<Result<void, IncomingStreamErr>> {
         if (typeof args !== 'string') {
             return new Err(IncomingStreamErr.Format);
@@ -197,6 +264,7 @@ export default class Instance {
         return ok();
     }
 
+    /** `refresh` stream (args: activity id): rebuild an activity with its context. */
     private async refresh(args: unknown): Promise<Result<void, IncomingStreamErr>> {
         if (typeof args !== 'string') {
             return new Err(IncomingStreamErr.Format);
@@ -211,6 +279,7 @@ export default class Instance {
         return ok();
     }
 
+    /** `action` stream (args: `{ fragmentId, name, data }`): run a fragment action. */
     private async action(args: unknown): Promise<Result<void, IncomingStreamErr>> {
         const argsType = t.type({
             fragmentId: t.string,
@@ -230,6 +299,7 @@ export default class Instance {
         return ok();
     }
 
+    /** `query` stream (args: `{ fragmentId, name, data }`): run a fragment query and return its answer. */
     private async query(args: unknown): Promise<Result<unknown, IncomingStreamErr>> {
         const argsType = t.type({
             fragmentId: t.string,
@@ -249,6 +319,10 @@ export default class Instance {
         return new Ok((result.unwrap() as Data).data);
     }
 
+    /**
+     * Serves one request stream name: for every incoming stream it runs `handler(args)`, writes the serialised result and
+     * closes the stream, until the socket closes.
+     */
     private async processStream(socket: Socket, streamName: string, handler: (args: unknown) => Promise<Result<unknown, unknown>>): Promise<void> {
         while (true) {
             const streamResult = await socket.incomingStream(streamName);
@@ -269,6 +343,13 @@ export default class Instance {
         }
     }
 
+    /**
+     * Starts the worker thread and waits for it to report the app title. On failure the instance is destroyed.
+     *
+     * @param onDestroy - Called once when the instance is destroyed.
+     * @returns `Ok` when the worker is ready; `Err` when it failed, exited, the instance was destroyed meanwhile, or `init`
+     *     was called twice.
+     */
     async init(onDestroy: () => void): Promise<R> {
         if (this.status !== Status.Created) {
             logger.warn('Tried to initiate instance more than once or when not in Created status');
@@ -323,6 +404,10 @@ export default class Instance {
         return err();
     }
 
+    /**
+     * Tears the instance down: runs `onDestroy`, closes both channels and the client socket, and terminates the worker after
+     * {@link Instance.terminationGracePeriodMs} unless it exits first. Idempotent.
+     */
     destroy(): void {
         const cleanup = this.onDestroy;
         this.onDestroy = undefined;
@@ -379,6 +464,10 @@ export default class Instance {
         }
     }
 
+    /**
+     * Forwards a worker request to the client as an outgoing stream and answers the worker with `Res` when the client closed
+     * the stream normally, `Rej` otherwise (also when no client is connected).
+     */
     private async outgoingStream(name: string, arg: unknown): Promise<void> {
         if (!this.userSocket || !this.responseSocket) {
             this.responseSocket?.write(new Rej());
@@ -398,6 +487,7 @@ export default class Instance {
         this.responseSocket.write(new Res());
     }
 
+    /** Serves the worker's requests one at a time (agent requests and client output) until the channel closes, then destroys the instance. */
     private async responseLoop(): Promise<void> {
         while (this.status !== Status.Destroyed) {
             if (!this.responseSocket) {

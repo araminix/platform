@@ -1,3 +1,9 @@
+/**
+ * Server layer: the HTTP/WebSocket {@link Endpoint}, its per-name {@link EndpointController}s, {@link ConnectRequest}
+ * and the {@link AuthProvider} contract with the client identity types.
+ *
+ * @module
+ */
 import { ConnectRequest } from './ConnectRequest.js';
 import Endpoint from './Endpoint.js';
 
