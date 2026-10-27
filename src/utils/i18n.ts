@@ -100,7 +100,7 @@ export class I18nService<LANGUAGE extends string | number, TEXT extends string> 
      * @param text - Text key.
      * @param lang - Language to use instead of the current one.
      * @returns The translation, or `text` itself (with a logged warning) when the language is not loaded or has no entry
-     *     for the key. An empty translation is returned as is, also with a warning.
+     *     for the key. An empty translation is returned as is, without a warning.
      */
     t(text: TEXT, lang?: LANGUAGE): string {
         const language = lang ?? this.language;
@@ -109,7 +109,7 @@ export class I18nService<LANGUAGE extends string | number, TEXT extends string> 
             return text;
         }
         const translated = this.translations[language]![text];
-        if (!translated) {
+        if (translated === undefined) {
             logger.warn(`I18nService - Missing TEXT translation:`, { text, language });
         }
         return translated ?? text;

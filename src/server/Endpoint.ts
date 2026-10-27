@@ -940,7 +940,9 @@ export default class Endpoint {
             .replace(/[\x00-\x1f\x7f-\x9f]/g, '')
             .trim();
         const safe = base === '.' || base === '..' || base === '' ? 'upload' : base;
-        return safe.slice(0, 255);
+        // index.json is the metadata file of every upload folder; an upload with that name would be overwritten by it.
+        const unreserved = safe.toLowerCase() === 'index.json' ? `_${safe}` : safe;
+        return unreserved.slice(0, 255);
     }
 
     /**
@@ -1083,6 +1085,14 @@ export default class Endpoint {
         this.express.use(
             `${this.mount}/file/`,
             validateToken,
+            (req: Request, res: Response, next: NextFunction) => {
+                // index.json holds upload metadata (including the uploader's user id); it is not a downloadable file.
+                if (path.basename(req.path) === 'index.json') {
+                    res.status(404).end();
+                    return;
+                }
+                next();
+            },
             expressCore.static(this.uploadDir!, {
                 index: false,
                 dotfiles: 'deny',
@@ -1378,13 +1388,14 @@ export default class Endpoint {
 
     /**
      * Terminates every open WebSocket and stops accepting HTTP connections. Pending {@link Endpoint.acquire} calls are not
-     * resolved, and the endpoint cannot be reopened after `close()`.
+     * resolved. A later {@link Endpoint.open} starts listening again.
      */
     close(): void {
         // server.close() only stops new connections; open WebSockets would keep it (and the process) alive.
         this.wsInstance.getWss().clients.forEach((client) => client.terminate());
         if (this.server) {
             this.server.close();
+            this.server = undefined;
         }
     }
 }

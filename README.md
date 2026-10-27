@@ -2,7 +2,7 @@
 
 > **Actor-based application runtime, WebSocket endpoint platform and multi-threaded agent engine for Node.js.**
 
-[![npm version](https://img.shields.io/badge/npm-2.2.1-blue.svg)](https://www.npmjs.com/package/@araminix/platform)
+[![npm version](https://img.shields.io/badge/npm-2.3.0-blue.svg)](https://www.npmjs.com/package/@araminix/platform)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![TypeScript](https://img.shields.io/badge/TypeScript-7-blue.svg)](https://www.typescriptlang.org/)
 [![Node.js](https://img.shields.io/badge/Node.js-%3E%3D22-green.svg)](https://nodejs.org/)
@@ -78,20 +78,20 @@
 ## Requirements
 
 - **Node.js 22 or later.** The package is ESM only (`"type": "module"` with an `exports` map), so load it with `import`. TypeScript projects need a module resolution that understands `exports` (`NodeNext` or `Bundler`).
-- **`@araminix/lib` in your application.** The platform imports `@araminix/lib` at runtime, but the `package.json` of version 2.2.0 lists it only as a development dependency (2.1.1). Install it yourself next to the platform. Keep exactly one copy in your dependency tree (check with `npm ls @araminix/lib`): `Result`, stream and connection objects are checked with `instanceof` across both packages. The platform is built and tested against `@araminix/lib` 2.1.1, and its sources also type-check against `@araminix/lib` 3.1.
+- **`@araminix/lib`** is installed with the platform as a regular dependency (pinned to 3.1.0). If your application also depends on `@araminix/lib` directly, use the same version, so that there is exactly one copy in your dependency tree (check with `npm ls @araminix/lib`): `Result`, stream and connection objects are checked with `instanceof` across both packages.
 - **Optional:** an S3-compatible server (MinIO) for attachments, and a TLS-terminating reverse proxy in production.
 
 ## Installation
 
 ```bash
 # npm
-npm install @araminix/platform @araminix/lib
+npm install @araminix/platform
 
 # pnpm
-pnpm add @araminix/platform @araminix/lib
+pnpm add @araminix/platform
 
 # yarn
-yarn add @araminix/platform @araminix/lib
+yarn add @araminix/platform
 ```
 
 Everything from `@araminix/lib` is re-exported, so application code can import `Ok`, `Err`, `Result`, `loop`, `logger` and friends from `@araminix/platform` directly.
@@ -619,7 +619,7 @@ Rules of thumb:
 - Most actors only work while their activity is the active one; otherwise the result is `Err(AppError.NonActive)`. An actor that does not belong to the activity (another activity's [`Close`](#close), a stage of another wizard) gives `Err(AppError.WrongAction)`. See [`AppResult`](#appresult).
 - Fragment updates are only sent while the activity is active.
 - An app keeps at most about `tabLimit` activities (default 12). Opening one more drops the second least recently used activity unless it is the one being left, so an instance can briefly hold `tabLimit + 1` activities.
-- Returning [`$nothing()`](#nothing) from a fragment action wakes the active activity again, which calls `afterWake()` once more without running the cleanup it returned before. Keep `afterWake()` idempotent, or return a different actor from such actions.
+- Returning [`$nothing()`](#nothing) from a fragment action wakes the active activity again. Since 2.3.0 the cleanup returned by the previous `afterWake()` runs first, so timers are not started twice.
 
 ### Wizards and stages
 
@@ -847,7 +847,7 @@ platform.endpoint.express.get('/api/me', (req, res) => {
 **Local uploads** are enabled with `uploadDir`:
 
 - `POST /file` takes one multipart file in the field `file` (at most `maxUploadBytes`, default 20 MiB, otherwise 413). An optional [`uploadAllowlist`](#uploadallowlist) restricts extensions and MIME types (otherwise 415).
-- The file is stored as `<uploadDir>/<uuid>/<sanitized name>` next to an `index.json`; the response is `{ name, size, mimetype, id, userId }` (the `FileInfo` type of `@araminix/lib`).
+- The file is stored as `<uploadDir>/<uuid>/<sanitized name>` next to an `index.json` with its metadata; the response is `{ name, size, mimetype, id, userId }` (the `FileInfo` type of `@araminix/lib`). An upload named `index.json` is stored as `_index.json`, and the metadata files themselves cannot be downloaded (404).
 - `GET /file/<id>` redirects to `GET /file/<id>/<name>`, which serves the file with `Content-Disposition: attachment`, `X-Content-Type-Options: nosniff` and `Content-Security-Policy: default-src 'none'; sandbox`.
 - Downloads require a session but are not limited to the uploader: any authenticated user who knows the id can download the file.
 - Cookie-authenticated uploads need an `X-Requested-With` (or `X-CSRF-Token`) header; the `@araminix/lib` client sends it.
@@ -978,7 +978,7 @@ All paths are relative to `mount`. "Session" means a valid signed `token` cookie
 | `WS`     | `/ws/:endpoint/:arg`                | session       | no      | upgrade                                 | same, with `arg`                                              | see [close codes](#close-codes-and-error-enums) |
 | `WS`     | `/ws-token/:token/:endpoint[/:arg]` | token in URL  | no      | upgrade                                 | **Deprecated**, same as `/ws/...`                             | see [close codes](#close-codes-and-error-enums) |
 
-The `/file` routes exist only with `uploadDir`, the `/attachments` routes only with `minio`. `/health` and `/version` never call `getInfo`. `/version` reports `EndpointOptions.version`, which [`Platform`](#platform) does not set (`0.0.0`).
+The `/file` routes exist only with `uploadDir`, the `/attachments` routes only with `minio`. `/health` and `/version` never call `getInfo`. `/version` reports `EndpointOptions.version`; with [`Platform`](#platform) set `PlatformConfig.version` (default `0.0.0`).
 
 ## Configuration reference
 
@@ -1156,7 +1156,7 @@ HTTP and WebSocket server built on Express 5 and `express-ws`. The constructor r
 - `declare(name)`: registers a WebSocket endpoint name; connections to undeclared names are closed with 4404. `acquire` declares implicitly.
 - `acquire(name)`: resolves with the next [`ConnectRequest`](#connectrequest) for `name`. Only one call per name may be pending; a second one ends the first with `Err`.
 - `open()`: listens on `port` (does nothing when already open; a busy port surfaces as an uncaught `error` event).
-- `close()`: terminates all WebSockets and stops listening; the endpoint cannot be reopened.
+- `close()`: terminates all WebSockets and stops listening; a later `open()` listens again.
 
 ```ts
 import { Endpoint, loop, LoopResult } from '@araminix/platform';
@@ -2452,6 +2452,19 @@ A disallowed browser `Origin` is refused during the handshake with HTTP 403, bef
 
 ## Migration notes
 
+### 2.3.0
+
+No breaking changes. Behaviour you may notice:
+
+- `@araminix/lib` 3.1.0 is a regular dependency again, so installing `@araminix/platform` installs it too. Remove a separate `@araminix/lib` from your application, or keep it on the same version.
+- A repeated wake of an activity (for example after a fragment action returns `$nothing()`) first runs the cleanup returned by the previous `afterWake()`, so timers and subscriptions are no longer started twice.
+- `PlatformConfig.version` is passed to the endpoint, so `GET /version` can report your version instead of `0.0.0`.
+- `Endpoint.close()` can be followed by `open()` again.
+- `GET /file/<id>/index.json` answers 404 (it exposed the uploader's user id), and an upload named `index.json` is stored as `_index.json` instead of being overwritten by the metadata.
+- `MinioService` appends the mimetype extension unless the name already ends with `.<ext>` (`reportpdf` + `application/pdf` becomes `reportpdf.pdf`).
+- `I18nService.t()` returns an empty translation without logging it as missing.
+- When an app is missing from the app index, the worker error names the app and the index path.
+
 ### 2.2.0
 
 - **Minification-safe type names.** Worker messages are tagged with [`typeNameOf()`](#typenameof) instead of the raw class name, and every protocol class declares `static typeName`. Fragments send `typeNameOf(fragmentClass)` to the front-end.
@@ -2462,7 +2475,7 @@ A disallowed browser `Origin` is refused during the handshake with HTTP 403, bef
 ### 2.0.0
 
 - **Node.js 22 or later** is required (`engines.node >= 22`), as for `@araminix/lib` 2.x, which uses the native `WebSocket`.
-- **`@araminix/lib` is provided by your application.** 2.0.0 declared it as a peer dependency (`^1.3.0 || ^2.0.0`); since 2.1.2 the `package.json` lists it only as a development dependency (2.1.1). Install it explicitly and keep a single copy.
+- **How `@araminix/lib` is declared changed several times:** 2.0.0 declared it as a peer dependency (`^1.3.0 || ^2.0.0`); 2.1.2 to 2.2.1 listed it only as a development dependency, so applications had to install it themselves; since 2.3.0 it is a regular dependency again (3.1.0).
 - **`@araminix/lib` 3.x**: the platform's sources type-check against lib 3.1, and the platform only calls `unwrap()` after checking `isOk()`/`isErr()`. Lib 3 makes `Err.unwrap()` always throw an `Error`; review your own code if it relied on catching the raw error value.
 - Behaviour changes since 1.x that you may notice: WebSocket messages are capped at 16 MiB and sockets are pinged every 30 seconds (1.10); error objects are no longer echoed to clients, only string and number codes (1.10); `/2fa/enable` and `/2fa/disable` share the authentication rate limit (1.10); a client may hold at most 32 connections per endpoint (2.1.0); activity changes of an instance are serialised by a lock (2.1.1).
 

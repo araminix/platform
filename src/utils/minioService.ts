@@ -220,7 +220,7 @@ export class MinioService {
     /** Appends the extension of `mimetype` (see {@link MimeToExtension}) unless `fileName` already ends with it. */
     private setFileExtension(mimetype: MIME_TYPE, fileName: string): string {
         const ext = MimeToExtension[mimetype];
-        if (ext && ext !== '*' && !fileName.endsWith(`.${ext}`) && !fileName.endsWith(ext)) {
+        if (ext && ext !== '*' && !fileName.endsWith(`.${ext}`)) {
             return fileName.endsWith('.') ? `${fileName}${ext}` : `${fileName}.${ext}`;
         }
         return fileName;

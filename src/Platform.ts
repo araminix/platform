@@ -84,6 +84,13 @@ export interface PlatformConfig {
      */
     mount?: string;
     /**
+     * Version reported by `GET /version` (for example your application's `package.json` version). See
+     * {@link EndpointOptions.version}.
+     *
+     * @defaultValue `'0.0.0'`
+     */
+    version?: string;
+    /**
      * See {@link EndpointOptions.cookieSecret}. Always set it in production.
      *
      * @defaultValue a random secret per process
@@ -295,6 +302,7 @@ export default class Platform {
             authProvider: config.authProvider,
             port: config.port,
             mount: config.mount,
+            version: config.version,
             cookieSecret: config.cookieSecret,
             uploadDir: config.uploadDir,
             maxUploadBytes: config.maxUploadBytes,

@@ -1,7 +1,7 @@
 {
     "name": "@araminix/platform",
     "description": "Enterprise-grade actor runtime, WebSocket endpoint platform, and agent execution engine",
-    "version": "2.2.1",
+    "version": "2.3.0",
     "main": "./dist/index.js",
     "types": "./dist/index.d.ts",
     "type": "module",

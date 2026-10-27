@@ -188,7 +188,7 @@ if (parentPort) {
     appIndex.appList;
     const app = (appIndex as any)[`${init.appName}`];
     if (!app || !(app instanceof App)) {
-        throw new Error(`App ${init.appName} not found in :\n`, appIndex);
+        throw new Error(`App "${init.appName}" not found in the app index ${init.appIndexPath}`);
     }
     const worker = new Worker(init.requestSocket, init.responseSocket, app, init.userId, init.tabLimit);
     parentPort.postMessage(typeof app.title === 'string' ? app.title : await app.title());

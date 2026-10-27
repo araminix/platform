@@ -428,8 +428,10 @@ export abstract class Activity<CONTEXT = unknown> {
         return this.$nothing();
     }
 
-    /** Calls `afterWake()` and stores its cleanup. */
+    /** Runs the cleanup of the previous wake, then calls `afterWake()` and stores its new cleanup. */
     private _afterWake(): void {
+        // A repeated wake (e.g. after an action returns $nothing()) must stop what the previous afterWake() started.
+        this._cleanUp();
         this.cleanUp = this.afterWake();
     }
 
@@ -443,7 +445,8 @@ export abstract class Activity<CONTEXT = unknown> {
 
     /**
      * Called every time the activity is woken: after its build was sent and whenever it becomes active again. Start timers,
-     * polling or subscriptions here and return a function that stops them.
+     * polling or subscriptions here and return a function that stops them. Before a repeated wake the previous cleanup runs,
+     * so this never runs twice without its cleanup in between.
      *
      * It runs outside the app lock, so a timer started here that calls {@link Activity.trigger} waits for the lock like any
      * other caller instead of interleaving with a running action.
