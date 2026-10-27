@@ -5,7 +5,7 @@ import AgentController from './agent/AgentController.js';
 import Instance from './executor/Instance.js';
 import { AppIndex, AppListing } from './lib/d.js';
 import { AuthProvider, ClientInfo, ClientType } from './server/AuthProvider.js';
-import Endpoint, { MinioOptions, RateLimitConfig, UploadAllowlist } from './server/Endpoint.js';
+import Endpoint, { EndpointOptions, MinioOptions, RateLimitConfig, UploadAllowlist } from './server/Endpoint.js';
 
 const DEFAULT_WORKER_REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
 
@@ -28,6 +28,13 @@ export interface PlatformConfig {
     allowedOrigins?: string[];
     authRateLimit?: RateLimitConfig | boolean;
     minio?: MinioOptions;
+    sessionTtl?: number;
+    cookieOptions?: EndpointOptions['cookieOptions'];
+    maxMessageBytes?: number;
+    heartbeatIntervalMs?: number;
+    trustProxy?: EndpointOptions['trustProxy'];
+    maxConnectionsPerClient?: number;
+    maxPendingStreams?: number;
     onCustomStream?: {
         [key: string]: (client: ClientInfo, stream: Stream) => Promise<void>;
     };
@@ -75,6 +82,13 @@ export default class Platform {
             allowedOrigins: config.allowedOrigins,
             authRateLimit: config.authRateLimit,
             minio: config.minio,
+            sessionTtl: config.sessionTtl,
+            cookieOptions: config.cookieOptions,
+            maxMessageBytes: config.maxMessageBytes,
+            heartbeatIntervalMs: config.heartbeatIntervalMs,
+            trustProxy: config.trustProxy,
+            maxConnectionsPerClient: config.maxConnectionsPerClient,
+            maxPendingStreams: config.maxPendingStreams,
         });
         this.agentController = new AgentController(this.config.agentIndexPath, undefined, this.workerRequestTimeoutMs);
         this.serve();

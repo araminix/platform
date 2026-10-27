@@ -6,3 +6,4 @@ export * from './ConnectRequest.js';
 export * from './Endpoint.js';
 export { Endpoint, ConnectRequest };
 export { default as EndpointController } from './EndpointController.js';
+export type { EndpointControllerOptions } from './EndpointController.js';

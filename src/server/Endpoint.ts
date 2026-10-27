@@ -12,7 +12,7 @@ import path from 'path';
 import { logMiddleware, MIME_TYPE, MimeToExtension, MinioOptions, MinioService } from '../utils/index.js';
 import { AuthProvider, ClientInfo, GoogleData } from './AuthProvider.js';
 import { ConnectRequest } from './ConnectRequest.js';
-import EndpointController from './EndpointController.js';
+import EndpointController, { EndpointControllerOptions } from './EndpointController.js';
 
 export { MinioOptions };
 
@@ -58,6 +58,8 @@ export interface EndpointOptions {
     maxMessageBytes?: number;
     heartbeatIntervalMs?: number;
     trustProxy?: boolean | number | string;
+    maxConnectionsPerClient?: number;
+    maxPendingStreams?: number;
 }
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -120,6 +122,7 @@ export default class Endpoint {
     private authRateLimit?: RateLimitConfig | boolean;
     private authRateLimiter: any;
     private heartbeatIntervalMs: number;
+    private readonly controllerOptions: EndpointControllerOptions;
     private readonly wsInstance: expressWs.Instance;
     readonly express: expressWs.Application;
     private server?: Server;
@@ -145,6 +148,8 @@ export default class Endpoint {
         maxMessageBytes = 16 * 1024 * 1024,
         heartbeatIntervalMs = 30000,
         trustProxy,
+        maxConnectionsPerClient,
+        maxPendingStreams,
     }: EndpointOptions) {
         this.authProvider = authProvider;
         this.port = port;
@@ -155,6 +160,7 @@ export default class Endpoint {
         }
         this.cookieSecret = cookieSecret || uuid();
         this.heartbeatIntervalMs = heartbeatIntervalMs;
+        this.controllerOptions = { maxConnectionsPerClient, maxPendingStreams };
         this.sessionTtl = sessionTtl;
         this.uploadDir = uploadDir;
         this.minio = minio;
@@ -260,7 +266,7 @@ export default class Endpoint {
 
     declare(name: string): void {
         if (!this.endpoints.has(name)) {
-            const endpointController = new EndpointController();
+            const endpointController = new EndpointController(this.controllerOptions);
             this.endpoints.set(name, endpointController);
         }
     }
