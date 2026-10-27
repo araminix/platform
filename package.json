@@ -1,7 +1,7 @@
 {
     "name": "@araminix/platform",
     "description": "Enterprise-grade actor runtime, WebSocket endpoint platform, and agent execution engine",
-    "version": "1.8.0",
+    "version": "1.8.1",
     "main": "./dist/index.js",
     "types": "./dist/index.d.ts",
     "type": "module",
@@ -73,8 +73,7 @@
     },
     "pnpm": {
         "overrides": {
-            "decode-uri-component": "0.5.1",
-            "stream-json": "3.7.0"
+            "decode-uri-component": "0.5.1"
         }
     }
 }

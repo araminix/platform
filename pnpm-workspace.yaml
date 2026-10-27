@@ -7,4 +7,3 @@ minimumReleaseAgeExclude:
     - axios@1.21.0
 overrides:
     decode-uri-component: '>=0.5.1'
-    stream-json: '>=3.7.0'
