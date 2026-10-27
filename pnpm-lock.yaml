@@ -11,6 +11,9 @@ importers:
 
   .:
     dependencies:
+      '@araminix/lib':
+        specifier: 3.1.0
+        version: 3.1.0(debug@4.4.3)
       axios:
         specifier: 1.21.0
         version: 1.21.0(debug@4.4.3)
@@ -33,9 +36,6 @@ importers:
         specifier: 2.5.0
         version: 2.5.0
     devDependencies:
-      '@araminix/lib':
-        specifier: 2.1.1
-        version: 2.1.1(debug@4.4.3)
       '@trivago/prettier-plugin-sort-imports':
         specifier: 6.0.2
         version: 6.0.2(prettier@3.9.10)
@@ -72,8 +72,8 @@ importers:
 
 packages:
 
-  '@araminix/lib@2.1.1':
-    resolution: {integrity: sha512-UAqrQB5DHF8PJxNEWF0D0sPtrmarV23uvl1vhawBYWAjaz990Q1bPikNZrwOy1BngzU6lQPdsHi5VzCV56QxFg==}
+  '@araminix/lib@3.1.0':
+    resolution: {integrity: sha512-r+tjW0ZaYmxTYI+diLVDHoAVjiX3KG697wwKSIGgtitIGWvyACMuuH7gP20fuTwbH4TTFZN9dV1mxBN1ySnzFQ==}
     engines: {node: '>=22'}
 
   '@babel/code-frame@7.29.7':
@@ -901,7 +901,7 @@ packages:
 
 snapshots:
 
-  '@araminix/lib@2.1.1(debug@4.4.3)':
+  '@araminix/lib@3.1.0(debug@4.4.3)':
     dependencies:
       axios: 1.20.0(debug@4.4.3)
       fp-ts: 2.16.11
