@@ -3,6 +3,7 @@ import { ResourceLimits } from 'worker_threads';
 
 import AgentController from './agent/AgentController.js';
 import Instance from './executor/Instance.js';
+import { evictOldestRegularInstances, findSingletonInstance } from './executor/instancePolicy.js';
 import { AppIndex, AppListing } from './lib/d.js';
 import { AuthProvider, ClientInfo, ClientType } from './server/AuthProvider.js';
 import Endpoint, { EndpointOptions, MinioOptions, RateLimitConfig, UploadAllowlist } from './server/Endpoint.js';
@@ -47,9 +48,18 @@ export interface PlatformConfig {
     authProvider: AuthProvider;
     /**
      * Maximum number of app instances one client runtime ({@link ClientInfo.runtimeId}) may run. When a new instance is
-     * requested at the limit, the least recently touched instances (by last client connection) are destroyed first.
+     * requested at the limit, the least recently touched non-singleton instances (by last client connection) are
+     * destroyed first.
      */
     instanceUserLimit: number;
+    /**
+     * App names that may have at most one instance per client runtime. A request for an already-running singleton returns
+     * its existing instance id; these instances do not count toward {@link PlatformConfig.instanceUserLimit} and are not
+     * evicted by it. A request with a different profile is rejected.
+     *
+     * @defaultValue none
+     */
+    singletonApps?: string[];
     /**
      * Maximum number of app instances across all clients. At the limit `createInstance` fails (the stream is closed with an
      * error and a warning is logged).
@@ -274,6 +284,8 @@ export default class Platform {
     private agentController: AgentController;
     /** Running app instances: client runtime id, then instance id. Read-only view for monitoring; do not modify it. */
     readonly instances: Map<string, Map<string, Instance>> = new Map();
+    private readonly singletonApps: ReadonlySet<string>;
+    private readonly instanceCreationLocks = new Map<string, Promise<void>>();
 
     /** Effective {@link PlatformConfig.workerRequestTimeoutMs}. */
     private get workerRequestTimeoutMs(): number {
@@ -298,6 +310,7 @@ export default class Platform {
      */
     constructor(config: PlatformConfig) {
         this.config = config;
+        this.singletonApps = new Set(config.singletonApps ?? []);
         this.endpoint = new Endpoint({
             authProvider: config.authProvider,
             port: config.port,
@@ -321,6 +334,24 @@ export default class Platform {
         });
         this.agentController = new AgentController(this.config.agentIndexPath, undefined, this.workerRequestTimeoutMs);
         this.serve();
+    }
+
+    private async withInstanceCreationLock<T>(runtimeId: string, operation: () => Promise<T>): Promise<T> {
+        const previous = this.instanceCreationLocks.get(runtimeId);
+        let release!: () => void;
+        const current = new Promise<void>((resolve) => {
+            release = resolve;
+        });
+        this.instanceCreationLocks.set(runtimeId, current);
+        await previous;
+        try {
+            return await operation();
+        } finally {
+            release();
+            if (this.instanceCreationLocks.get(runtimeId) === current) {
+                this.instanceCreationLocks.delete(runtimeId);
+            }
+        }
     }
 
     /** Starts the accept loops of the `platform`, `instance` and `agent` endpoints. */
@@ -557,8 +588,8 @@ export default class Platform {
 
     /**
      * Serves `createInstance` streams: validates `{ appName, profile }` against the user's app listing, applies
-     * `instanceUserLimit` (evicting the least recently touched instances) and `maxInstances`, starts the instance and answers
-     * its id. Any failure closes the stream with an error.
+     * `instanceUserLimit` (evicting the least recently touched non-singletons) and `maxInstances`, starts the instance and
+     * answers its id. Singleton apps reuse an existing instance. Any failure closes the stream with an error.
      */
     private processInstanceStream(userId: string, runtimeId: string, endpointSocket: Socket): void {
         const startInstanceArg = t.type({
@@ -571,116 +602,123 @@ export default class Platform {
                 return LoopResult.Stop;
             }
             const stream = streamResult.unwrap();
-            let createdInstance: Instance | undefined;
-            try {
-                if (!startInstanceArg.is(stream.args)) {
-                    stream.closeErr();
-                    return LoopResult.Cont;
-                }
-                const appName = stream.args.appName;
-                const profile = stream.args.profile;
-                const userApps = await this.appIndex.userApps(userId);
-                if (userApps.isErr()) {
-                    stream.closeErr();
-                    return LoopResult.Cont;
-                }
-                const appSearch = userApps.unwrap().find((listing) => {
-                    const app = listing.apps.find((a) => a.name === appName && a.profiles.includes(profile));
-                    return app !== undefined;
-                });
-                if (appSearch === undefined) {
-                    stream.closeErr();
-                    return LoopResult.Cont;
-                }
-                if (!this.instances.has(runtimeId)) {
-                    this.instances.set(runtimeId, new Map());
-                }
-                const instances = this.instances.get(runtimeId)!;
-                const limit = this.config.instanceUserLimit;
-                while (instances.size >= limit) {
-                    let oldest: Instance | undefined;
-                    for (const inst of instances.values()) {
-                        if (!oldest || inst.touched < oldest.touched) {
-                            oldest = inst;
+            return this.withInstanceCreationLock(runtimeId, async () => {
+                let createdInstance: Instance | undefined;
+                try {
+                    if (!startInstanceArg.is(stream.args)) {
+                        stream.closeErr();
+                        return LoopResult.Cont;
+                    }
+                    const appName = stream.args.appName;
+                    const profile = stream.args.profile;
+                    const userApps = await this.appIndex.userApps(userId);
+                    if (userApps.isErr()) {
+                        stream.closeErr();
+                        return LoopResult.Cont;
+                    }
+                    const appSearch = userApps.unwrap().find((listing) => {
+                        const app = listing.apps.find((a) => a.name === appName && a.profiles.includes(profile));
+                        return app !== undefined;
+                    });
+                    if (appSearch === undefined) {
+                        stream.closeErr();
+                        return LoopResult.Cont;
+                    }
+                    if (!this.instances.has(runtimeId)) {
+                        this.instances.set(runtimeId, new Map());
+                    }
+                    const instances = this.instances.get(runtimeId)!;
+                    const isSingleton = this.singletonApps.has(appName);
+                    if (isSingleton) {
+                        const existing = findSingletonInstance(instances.values(), appName);
+                        if (existing) {
+                            if (existing.userId !== userId || existing.profile !== profile) {
+                                stream.closeErr();
+                                return LoopResult.Cont;
+                            }
+                            const writeResult = await stream.write(existing.id);
+                            if (writeResult.isErr()) {
+                                return LoopResult.Cont;
+                            }
+                            existing.touch();
+                            stream.closeOk();
+                            return LoopResult.Cont;
                         }
+                    } else {
+                        evictOldestRegularInstances(instances, this.config.instanceUserLimit, this.singletonApps);
                     }
-                    if (!oldest) {
-                        break;
-                    }
-                    instances.delete(oldest.id);
-                    oldest.destroy();
-                }
 
-                if (this.config.maxInstances !== undefined && this.totalInstances >= this.config.maxInstances) {
-                    if (instances.size === 0) {
-                        this.instances.delete(runtimeId);
-                    }
-                    logger.warn(`Global instance limit reached (${this.totalInstances}/${this.config.maxInstances}). Rejecting createInstance.`);
-                    stream.closeErr();
-                    return LoopResult.Cont;
-                }
-
-                const instance = new Instance(
-                    userId,
-                    appName,
-                    profile,
-                    this.config.appIndexPath,
-                    this.config.tabLimit ?? 12,
-                    this.agentController,
-                    this.config.resourceLimits,
-                    undefined,
-                    this.workerRequestTimeoutMs,
-                );
-                createdInstance = instance;
-                instances.set(instance.id, instance);
-                const instanceInitResult = await instance.init(() => {
-                    const insts = this.instances.get(runtimeId);
-                    if (insts) {
-                        insts.delete(instance.id);
-                        if (insts.size === 0) {
+                    if (this.config.maxInstances !== undefined && this.totalInstances >= this.config.maxInstances) {
+                        if (instances.size === 0) {
                             this.instances.delete(runtimeId);
                         }
+                        logger.warn(`Global instance limit reached (${this.totalInstances}/${this.config.maxInstances}). Rejecting createInstance.`);
+                        stream.closeErr();
+                        return LoopResult.Cont;
                     }
-                });
-                if (instanceInitResult.isErr()) {
-                    instances.delete(instance.id);
-                    if (instances.size === 0) {
-                        this.instances.delete(runtimeId);
-                    }
-                    instance.destroy();
-                    stream.closeErr();
-                    return LoopResult.Cont;
-                }
-                const writeResult = await stream.write(instance.id);
-                if (writeResult.isErr()) {
-                    instances.delete(instance.id);
-                    if (instances.size === 0) {
-                        this.instances.delete(runtimeId);
-                    }
-                    instance.destroy();
-                    return LoopResult.Cont;
-                }
-                stream.closeOk();
-                return LoopResult.Cont;
-            } catch (err) {
-                logger.error('Error processing createInstance stream:', err);
-                if (createdInstance) {
-                    const insts = this.instances.get(runtimeId);
-                    if (insts) {
-                        insts.delete(createdInstance.id);
-                        if (insts.size === 0) {
+
+                    const instance = new Instance(
+                        userId,
+                        appName,
+                        profile,
+                        this.config.appIndexPath,
+                        this.config.tabLimit ?? 12,
+                        this.agentController,
+                        this.config.resourceLimits,
+                        undefined,
+                        this.workerRequestTimeoutMs,
+                    );
+                    createdInstance = instance;
+                    instances.set(instance.id, instance);
+                    const instanceInitResult = await instance.init(() => {
+                        const insts = this.instances.get(runtimeId);
+                        if (insts) {
+                            insts.delete(instance.id);
+                            if (insts.size === 0) {
+                                this.instances.delete(runtimeId);
+                            }
+                        }
+                    });
+                    if (instanceInitResult.isErr()) {
+                        instances.delete(instance.id);
+                        if (instances.size === 0) {
                             this.instances.delete(runtimeId);
                         }
+                        instance.destroy();
+                        stream.closeErr();
+                        return LoopResult.Cont;
+                    }
+                    const writeResult = await stream.write(instance.id);
+                    if (writeResult.isErr()) {
+                        instances.delete(instance.id);
+                        if (instances.size === 0) {
+                            this.instances.delete(runtimeId);
+                        }
+                        instance.destroy();
+                        return LoopResult.Cont;
+                    }
+                    stream.closeOk();
+                    return LoopResult.Cont;
+                } catch (err) {
+                    logger.error('Error processing createInstance stream:', err);
+                    if (createdInstance) {
+                        const insts = this.instances.get(runtimeId);
+                        if (insts) {
+                            insts.delete(createdInstance.id);
+                            if (insts.size === 0) {
+                                this.instances.delete(runtimeId);
+                            }
+                        }
+                        try {
+                            createdInstance.destroy();
+                        } catch {}
                     }
                     try {
-                        createdInstance.destroy();
+                        stream.closeErr();
                     } catch {}
+                    return LoopResult.Cont;
                 }
-                try {
-                    stream.closeErr();
-                } catch {}
-                return LoopResult.Cont;
-            }
+            });
         });
     }
 

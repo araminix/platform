@@ -3,7 +3,7 @@
  *
  * @module
  */
-import { AppResult } from './AppInstance.js';
+import { AppError, AppResult } from './AppInstance.js';
 import workerDriver from './workerDriver.js';
 
-export { AppResult, workerDriver };
+export { AppError, AppResult, workerDriver };
