@@ -3,13 +3,17 @@ import { ResourceLimits } from 'worker_threads';
 
 import AgentController from './agent/AgentController.js';
 import Instance from './executor/Instance.js';
-import { evictOldestRegularInstances, findSingletonInstance } from './executor/instancePolicy.js';
+import { evictOldestRegularInstances, findIdleInstances, findSingletonInstance } from './executor/instancePolicy.js';
 import { AppIndex, AppListing } from './lib/d.js';
 import { AuthProvider, ClientInfo, ClientType } from './server/AuthProvider.js';
 import Endpoint, { EndpointOptions, MinioOptions, RateLimitConfig, UploadAllowlist } from './server/Endpoint.js';
 
 /** Default of {@link PlatformConfig.workerRequestTimeoutMs}: 5 minutes. */
 const DEFAULT_WORKER_REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
+/** Default of {@link PlatformConfig.instanceIdleTimeoutMs}: 15 minutes. */
+const DEFAULT_INSTANCE_IDLE_TIMEOUT_MS = 15 * 60 * 1000;
+/** How often idle instances are looked for. */
+const IDLE_SWEEP_INTERVAL_MS = 60 * 1000;
 
 /**
  * Configuration of {@link Platform}. The first group configures the runtime; the rest is forwarded unchanged to the
@@ -67,6 +71,16 @@ export interface PlatformConfig {
      * @defaultValue unlimited
      */
     maxInstances?: number;
+    /**
+     * How long an app instance may stay without a client socket before it is destroyed, in milliseconds. The clock starts
+     * when the instance's connection is destroyed (the client closed it, or it stayed without a WebSocket for the
+     * connection's `hp`, 5 minutes by default), or when the instance is created and no client connects. Every instance is a
+     * worker thread, so without this an abandoned app keeps its memory and timers until the server restarts. Checked once a
+     * minute; `0` keeps idle instances forever.
+     *
+     * @defaultValue `900000` (15 minutes)
+     */
+    instanceIdleTimeoutMs?: number;
     /**
      * Node.js `resourceLimits` of every app worker thread. Agent workers are not limited.
      *
@@ -286,6 +300,8 @@ export default class Platform {
     readonly instances: Map<string, Map<string, Instance>> = new Map();
     private readonly singletonApps: ReadonlySet<string>;
     private readonly instanceCreationLocks = new Map<string, Promise<void>>();
+    /** Periodic check for idle instances, started by {@link Platform.start}. */
+    private idleSweepTimer?: NodeJS.Timeout;
 
     /** Effective {@link PlatformConfig.workerRequestTimeoutMs}. */
     private get workerRequestTimeoutMs(): number {
@@ -777,10 +793,35 @@ export default class Platform {
         const AppIndexClass = (await import(this.config.appIndexPath.href)).default;
         this.appIndex = new AppIndexClass();
         this.endpoint.open();
+        const idleTimeoutMs = this.config.instanceIdleTimeoutMs ?? DEFAULT_INSTANCE_IDLE_TIMEOUT_MS;
+        if (idleTimeoutMs > 0 && !this.idleSweepTimer) {
+            this.idleSweepTimer = setInterval(() => this.destroyIdleInstances(idleTimeoutMs), Math.min(IDLE_SWEEP_INTERVAL_MS, idleTimeoutMs));
+            this.idleSweepTimer.unref();
+        }
+    }
+
+    /** Destroys the instances that have had no client socket for `idleTimeoutMs` ({@link PlatformConfig.instanceIdleTimeoutMs}). */
+    private destroyIdleInstances(idleTimeoutMs: number): void {
+        const now = Date.now();
+        for (const [runtimeId, userInstances] of [...this.instances]) {
+            for (const instance of findIdleInstances(userInstances.values(), now, idleTimeoutMs)) {
+                const idleMinutes = Math.round((now - (instance.idleSince ?? now)) / 60000);
+                logger.info(`Destroying idle app instance ${instance.id} (${instance.appName}): no client for ${idleMinutes} min.`);
+                userInstances.delete(instance.id);
+                instance.destroy();
+            }
+            if (userInstances.size === 0) {
+                this.instances.delete(runtimeId);
+            }
+        }
     }
 
     /** Destroys every app instance and agent worker and closes the endpoint (open WebSockets are terminated). */
     stop(): void {
+        if (this.idleSweepTimer) {
+            clearInterval(this.idleSweepTimer);
+            this.idleSweepTimer = undefined;
+        }
         for (const userInstances of this.instances.values()) {
             for (const instance of [...userInstances.values()]) {
                 instance.destroy();

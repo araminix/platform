@@ -93,6 +93,8 @@ export default class Instance {
     private _touched: number = Date.now();
     /** The client's current socket. */
     private userSocket?: Socket = undefined;
+    /** When the instance last lost its client socket (or was created without one); `undefined` while a client is connected. */
+    private disconnectedSince?: number = Date.now();
     /** Pending forced termination of the worker. */
     private terminationTimer?: NodeJS.Timeout = undefined;
 
@@ -150,6 +152,15 @@ export default class Instance {
     }
 
     /**
+     * Since when no client socket has been attached, in milliseconds; `undefined` while one is. A socket counts as attached
+     * until its connection is destroyed, so short network drops that the client reconnects through do not start the clock.
+     * {@link Platform} destroys instances that stay without a client for `instanceIdleTimeoutMs`.
+     */
+    get idleSince(): number | undefined {
+        return this.disconnectedSince;
+    }
+
+    /**
      * Attaches the client's socket (destroying a previous one) and serves its request streams until it closes.
      *
      * @param socket - The accepted socket of the `instance` endpoint.
@@ -160,6 +171,7 @@ export default class Instance {
             this.userSocket.destroy();
         }
         this.userSocket = socket;
+        this.disconnectedSince = undefined;
         once(async () => {
             this.processStream(socket, 'load', () => this.load()).catch((err) => {
                 logger.error('Unhandled error in processStream load:', err);
@@ -188,6 +200,7 @@ export default class Instance {
             await socket.waitClose();
             if (this.userSocket === socket) {
                 this.userSocket = undefined;
+                this.disconnectedSince = Date.now();
             }
         });
     }

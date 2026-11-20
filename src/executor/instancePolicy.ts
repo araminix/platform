@@ -9,6 +9,18 @@ export function findSingletonInstance(instances: Iterable<Instance>, appName: st
     return undefined;
 }
 
+/** Instances that have had no client socket for at least `idleTimeoutMs` at time `now`. */
+export function findIdleInstances(instances: Iterable<Instance>, now: number, idleTimeoutMs: number): Instance[] {
+    const idle: Instance[] = [];
+    for (const instance of instances) {
+        const since = instance.idleSince;
+        if (since !== undefined && now - since >= idleTimeoutMs) {
+            idle.push(instance);
+        }
+    }
+    return idle;
+}
+
 export function evictOldestRegularInstances(instances: Map<string, Instance>, limit: number, singletonApps: ReadonlySet<string>): void {
     let regularCount = 0;
     for (const instance of instances.values()) {

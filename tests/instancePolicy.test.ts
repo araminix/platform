@@ -1,9 +1,24 @@
+import { CloseCodes, Err, Socket, SocketErr } from '@araminix/lib';
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
 import AgentController from '../src/agent/AgentController.js';
 import Instance from '../src/executor/Instance.js';
-import { evictOldestRegularInstances, findSingletonInstance } from '../src/executor/instancePolicy.js';
+import { evictOldestRegularInstances, findIdleInstances, findSingletonInstance } from '../src/executor/instancePolicy.js';
+
+// A client socket that serves no streams and closes when `close` is called.
+function fakeSocket(): { socket: Socket; close: () => void } {
+    let resolveClose!: (code: CloseCodes) => void;
+    const closed = new Promise<CloseCodes>((resolve) => {
+        resolveClose = resolve;
+    });
+    const socket = {
+        incomingStream: async () => new Err(SocketErr.Closed),
+        waitClose: async () => closed,
+        destroy: () => resolveClose(CloseCodes.Intentional),
+    } as unknown as Socket;
+    return { socket, close: () => resolveClose(CloseCodes.Died) };
+}
 
 function createInstance(id: string, appName: string, touched: number, profile: string | null = null): Instance {
     const instance = new Instance('user-1', appName, profile, new URL('file:///dummy'), 10, {} as AgentController);
@@ -34,5 +49,32 @@ describe('instance policy', () => {
         assert.ok(instances.has(widget.id));
         assert.ok(!instances.has('regular-0'));
         assert.ok(instances.has('regular-5'));
+    });
+
+    it('tracks since when an instance has had no client socket', async () => {
+        const instance = createInstance('instance-1', 'app', 1);
+        assert.ok(instance.idleSince !== undefined, 'a new instance counts as idle until a client connects');
+
+        const { socket, close } = fakeSocket();
+        instance.connect(socket);
+        assert.strictEqual(instance.idleSince, undefined);
+
+        const beforeClose = Date.now();
+        close();
+        await new Promise((resolve) => setImmediate(resolve));
+        assert.ok((instance.idleSince ?? 0) >= beforeClose);
+    });
+
+    it('finds only the instances idle for at least the timeout', () => {
+        const idle = createInstance('idle-1', 'app-a', 1);
+        const connected = createInstance('connected-1', 'app-b', 2);
+        connected.connect(fakeSocket().socket);
+        const since = idle.idleSince ?? 0;
+
+        assert.deepStrictEqual(
+            findIdleInstances([idle, connected], since + 1000, 1000).map((instance) => instance.id),
+            ['idle-1'],
+        );
+        assert.deepStrictEqual(findIdleInstances([idle, connected], since + 999, 1000), []);
     });
 });
