@@ -221,6 +221,9 @@ export class ActivityInstance {
                 if (this.status >= Status.Rendered) {
                     return ok();
                 }
+            } else {
+                // Shown again (tab switch, closed tab, finished wizard): prepare() did not run, so update the client's tabs here.
+                await this.driver.updateActivityList();
             }
             const build = await builder.build(this.activityDriver, this.activityInterface.render);
             this.panel = build.mainPanel._build();

@@ -5,19 +5,22 @@ import { beforeEach, describe, it } from 'node:test';
 import panel from '../src/builder/Panel.js';
 import { ActivityInterface } from '../src/executor/ActivityInstance.js';
 import { AppInstance } from '../src/executor/AppInstance.js';
-import { SendBuild } from '../src/executor/proto.js';
+import { type ActivityList, SendBuild, UpdateActivityList } from '../src/executor/proto.js';
 import { initWorkerDriver } from '../src/executor/workerDriver.js';
 import { type Actor, Nothing, OpenPage, PopPage, Refresh } from '../src/lib/actors.js';
 import { Res } from '../src/lib/worker_socket.js';
 
 let builds: SendBuild[] = [];
+let tabLists: ActivityList[] = [];
 
-// Answers every request from the app to the main thread and records the builds it sends to the client.
+// Answers every request from the app to the main thread and records the builds and tab lists it sends to the client.
 function recordBuilds(): void {
     builds = [];
+    tabLists = [];
     initWorkerDriver('user-1', null, 'app', {
         writeRead: async (request: unknown) => {
             if (request instanceof SendBuild) builds.push(request);
+            if (request instanceof UpdateActivityList) tabLists.push(request.list);
             return new Ok(new Res());
         },
         close: () => undefined,
@@ -105,6 +108,38 @@ describe('activity loading', () => {
         assert.strictEqual(builds.length, 1);
         assert.strictEqual(builds[0].data.activityId, mainId);
         assert.ok(builds[0].data.build, 'the build has content');
+    });
+
+    it('marks the tab switched to as active in the tab list', async () => {
+        const app = await startedApp(page('main'));
+        const mainId = app.activeId;
+        await active(app).handleActor(new OpenPage(page('second'), undefined));
+        builds = [];
+        tabLists = [];
+
+        await app.switch(mainId);
+
+        assert.strictEqual(builds.length, 1);
+        assert.strictEqual(builds[0].data.activityId, mainId);
+        const lastList = tabLists.at(-1);
+        assert.ok(lastList, 'a tab list was sent');
+        assert.deepStrictEqual(
+            lastList.filter((tab) => tab.active).map((tab) => tab.title),
+            ['main'],
+        );
+    });
+
+    it('drops a closed tab from the tab list', async () => {
+        const app = await startedApp(page('main'));
+        await active(app).handleActor(new OpenPage(page('second'), undefined));
+        tabLists = [];
+
+        await app.close(app.activeId);
+
+        assert.deepStrictEqual(
+            tabLists.at(-1)?.map((tab) => tab.title),
+            ['main'],
+        );
     });
 
     it('builds once when beforeRender() refreshes the page with a default context', async () => {
