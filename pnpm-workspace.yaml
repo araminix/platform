@@ -7,3 +7,5 @@ minimumReleaseAgeExclude:
   - axios@1.21.0
 overrides:
   decode-uri-component: '>=0.5.1'
+  # minio 8.0.7 (latest) allows a fast-xml-parser version with a known CPU-exhaustion bug.
+  fast-xml-parser@<5.11.3: ^5.11.3
