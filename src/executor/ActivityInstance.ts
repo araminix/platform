@@ -217,6 +217,10 @@ export class ActivityInstance {
                 if (prepareResult.isErr()) {
                     return prepareResult;
                 }
+                // beforeRender()'s actor may have rendered and sent this activity already ($refresh with a new context).
+                if (this.status >= Status.Rendered) {
+                    return ok();
+                }
             }
             const build = await builder.build(this.activityDriver, this.activityInterface.render);
             this.panel = build.mainPanel._build();
@@ -331,8 +335,15 @@ export class ActivityInstance {
         return new Ok(result);
     }
 
-    /** Marks the activity awake, calls `afterWake()` outside the app lock, and loads its pop-up if it has one. */
+    /**
+     * Marks the activity awake, calls `afterWake()` outside the app lock, and loads its pop-up if it has one. An activity
+     * with no current build (just opened, popped or replaced, or suspended since) is loaded instead: built, sent to the
+     * client and then woken by {@link ActivityInstance.load}.
+     */
     async wake(): Promise<AppResult> {
+        if (this.status < Status.Rendered) {
+            return await this.load();
+        }
         this.status = Status.Waked;
         // afterWake is where activities start timers; keep them out of the current lock context.
         this.driver.outsideLock(() => this.activityInterface.afterWake());
