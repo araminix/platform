@@ -142,6 +142,39 @@ describe('activity loading', () => {
         );
     });
 
+    it('sends the page under a pop again when the user closes the pop', async () => {
+        const app = await startedApp(page('main'));
+        const mainId = app.activeId;
+        await active(app).handleActor(new PopPage(page('pop'), undefined));
+        const popId = app.activeId;
+        builds = [];
+
+        const result = await app.userClose(popId);
+
+        assert.ok(result.isOk());
+        assert.strictEqual(app.activeId, mainId);
+        assert.strictEqual(builds.length, 1, 'the client gets the page, which closes the pop on its side');
+        assert.strictEqual(builds[0].data.activityId, mainId);
+        assert.strictEqual(builds[0].data.isPop, false);
+        assert.ok(builds[0].data.build, 'the build has content');
+    });
+
+    it('shows the first pop again when the user closes a pop opened from it', async () => {
+        const app = await startedApp(page('main'));
+        await active(app).handleActor(new PopPage(page('first'), undefined));
+        const firstId = app.activeId;
+        await active(app).handleActor(new PopPage(page('second'), undefined));
+        builds = [];
+
+        const result = await app.userClose(app.activeId);
+
+        assert.ok(result.isOk());
+        assert.strictEqual(app.activeId, firstId);
+        assert.strictEqual(builds.length, 1);
+        assert.strictEqual(builds[0].data.activityId, firstId);
+        assert.strictEqual(builds[0].data.isPop, true);
+    });
+
     it('builds once when beforeRender() refreshes the page with a default context', async () => {
         await startedApp(page('main', (ctx, template) => (ctx?.ready ? new Nothing() : new Refresh(template, { ready: true }))));
 

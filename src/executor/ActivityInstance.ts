@@ -528,14 +528,13 @@ export class ActivityInstance {
         return new Err(AppError.WrongAction);
     }
 
-    /** Returns to the source activity without waking it, or closes this activity when it has no source. */
+    /**
+     * Returns to the source activity, or closes this activity when it has no source. The source was suspended when this
+     * activity took its place, so it is woken: built and sent again, which is also what closes a pop-up on the client.
+     */
     async cancel(): Promise<AppResult> {
         if (this.sourceActivity) {
-            const result = await this.driver.replace(this.sourceActivity, false);
-            if (result.isErr()) {
-                return result;
-            }
-            return ok();
+            return await this.driver.replace(this.sourceActivity);
         }
         return await this.driver.close();
     }
