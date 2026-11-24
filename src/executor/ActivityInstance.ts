@@ -229,6 +229,9 @@ export class ActivityInstance {
             this.panel = build.mainPanel._build();
             this.fragments = build.fragments;
             this.status = Status.Rendered;
+        } else {
+            // Built already: the client is loading it again (it reconnected or came back to this app), so it needs the tabs too.
+            await this.driver.updateActivityList();
         }
         const result = await this.driver.sendBuild(this.panel!, this.isPop, this.hasPrev());
         if (result.isErr()) {
@@ -578,6 +581,20 @@ export class StageInstance extends ActivityInstance {
     /** A stage can go back to the previous stage or, on the first stage, to the wizard's source. */
     hasPrev(): boolean {
         return !!this.underActivity || !!this.sourceActivity;
+    }
+
+    /**
+     * The client's back button, which {@link StageInstance.hasPrev} enables: like `$back`, the first stage of a pop-up or
+     * attached wizard cancels the wizard and returns to its source.
+     */
+    async prev(): Promise<AppResult> {
+        if (this.underActivity) {
+            return await this.driver.replace(this.underActivity);
+        }
+        if (this.sourceActivity) {
+            return await this.cancel();
+        }
+        return new Err(AppError.WrongAction);
     }
 
     /** `$back`: previous stage, or cancel the wizard on the first stage of an attached or pop-up wizard. */

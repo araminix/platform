@@ -7,7 +7,7 @@ import { ActivityInterface } from '../src/executor/ActivityInstance.js';
 import { AppInstance } from '../src/executor/AppInstance.js';
 import { type ActivityList, SendBuild, UpdateActivityList } from '../src/executor/proto.js';
 import { initWorkerDriver } from '../src/executor/workerDriver.js';
-import { type Actor, Nothing, OpenPage, PopPage, Refresh } from '../src/lib/actors.js';
+import { type Actor, Nothing, OpenPage, PopPage, Refresh, WizardPop } from '../src/lib/actors.js';
 import { Res } from '../src/lib/worker_socket.js';
 
 let builds: SendBuild[] = [];
@@ -173,6 +173,35 @@ describe('activity loading', () => {
         assert.strictEqual(builds.length, 1);
         assert.strictEqual(builds[0].data.activityId, firstId);
         assert.strictEqual(builds[0].data.isPop, true);
+    });
+
+    it('sends the tab list again when the client loads an app it has already built', async () => {
+        const app = await startedApp(page('main'));
+        await active(app).handleActor(new OpenPage(page('second'), undefined));
+        tabLists = [];
+
+        await app.load();
+
+        assert.deepStrictEqual(
+            tabLists.at(-1)?.map((tab) => tab.title),
+            ['main', 'second'],
+        );
+    });
+
+    it('goes back from the first stage of a pop-up wizard to the page that opened it', async () => {
+        const app = await startedApp(page('main'));
+        const mainId = app.activeId;
+        await active(app).handleActor(new WizardPop(page('stage') as never, undefined, () => new Nothing()));
+        const stageId = app.activeId;
+        assert.notStrictEqual(stageId, mainId);
+        builds = [];
+
+        const result = await app.prev(stageId);
+
+        assert.ok(result.isOk());
+        assert.strictEqual(app.activeId, mainId);
+        assert.strictEqual(builds.at(-1)?.data.activityId, mainId);
+        assert.strictEqual(builds.at(-1)?.data.isPop, false);
     });
 
     it('builds once when beforeRender() refreshes the page with a default context', async () => {
