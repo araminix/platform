@@ -4,7 +4,7 @@ import { describe, it } from 'node:test';
 
 import AgentController from '../src/agent/AgentController.js';
 import Instance from '../src/executor/Instance.js';
-import { evictOldestRegularInstances, findIdleInstances, findSingletonInstance } from '../src/executor/instancePolicy.js';
+import { countUserInstances, evictOldestRegularInstances, findIdleInstances, findSingletonInstance } from '../src/executor/instancePolicy.js';
 
 // A client socket that serves no streams and closes when `close` is called.
 function fakeSocket(): { socket: Socket; close: () => void } {
@@ -76,5 +76,28 @@ describe('instance policy', () => {
             ['idle-1'],
         );
         assert.deepStrictEqual(findIdleInstances([idle, connected], since + 999, 1000), []);
+    });
+
+    it('counts all instances belonging to a user across multiple runtimes', () => {
+        const u1a = new Instance('user-1', 'app-a', null, new URL('file:///dummy'), 10, {} as AgentController);
+        const u1b = new Instance('user-1', 'app-b', null, new URL('file:///dummy'), 10, {} as AgentController);
+        const u1c = new Instance('user-1', 'notification', null, new URL('file:///dummy'), 10, {} as AgentController);
+        const u2a = new Instance('user-2', 'app-a', null, new URL('file:///dummy'), 10, {} as AgentController);
+
+        const allInstances = new Map<string, Map<string, Instance>>([
+            [
+                'rt-a',
+                new Map([
+                    [u1a.id, u1a],
+                    [u1c.id, u1c],
+                ]),
+            ],
+            ['rt-b', new Map([[u1b.id, u1b]])],
+            ['rt-c', new Map([[u2a.id, u2a]])],
+        ]);
+
+        assert.strictEqual(countUserInstances(allInstances, 'user-1'), 3);
+        assert.strictEqual(countUserInstances(allInstances, 'user-2'), 1);
+        assert.strictEqual(countUserInstances(allInstances, 'user-3'), 0);
     });
 });

@@ -21,6 +21,19 @@ export function findIdleInstances(instances: Iterable<Instance>, now: number, id
     return idle;
 }
 
+/** Counts all running app instances belonging to `userId` across all client runtimes. */
+export function countUserInstances(allInstances: ReadonlyMap<string, ReadonlyMap<string, Instance>>, userId: string): number {
+    let count = 0;
+    for (const runtimeInstances of allInstances.values()) {
+        for (const instance of runtimeInstances.values()) {
+            if (instance.userId === userId) {
+                count++;
+            }
+        }
+    }
+    return count;
+}
+
 export function evictOldestRegularInstances(instances: Map<string, Instance>, limit: number, singletonApps: ReadonlySet<string>): void {
     let regularCount = 0;
     for (const instance of instances.values()) {

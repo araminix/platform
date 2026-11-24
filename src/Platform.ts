@@ -3,7 +3,7 @@ import { ResourceLimits } from 'worker_threads';
 
 import AgentController from './agent/AgentController.js';
 import Instance from './executor/Instance.js';
-import { evictOldestRegularInstances, findIdleInstances, findSingletonInstance } from './executor/instancePolicy.js';
+import { countUserInstances, evictOldestRegularInstances, findIdleInstances, findSingletonInstance } from './executor/instancePolicy.js';
 import { AppIndex, AppListing } from './lib/d.js';
 import { AuthProvider, ClientInfo, ClientType } from './server/AuthProvider.js';
 import Endpoint, { EndpointOptions, MinioOptions, RateLimitConfig, UploadAllowlist } from './server/Endpoint.js';
@@ -71,6 +71,16 @@ export interface PlatformConfig {
      * @defaultValue unlimited
      */
     maxInstances?: number;
+    /**
+     * Maximum number of app instances one user ({@link ClientInfo.id}) may hold across all concurrent sessions/devices
+     * ({@link ClientInfo.runtimeId}). Because {@link PlatformConfig.instanceUserLimit} applies per session (`runtimeId`),
+     * this cap prevents a single user from multiplying worker threads across many concurrent sessions. At the limit,
+     * `createInstance` fails (the stream is closed with an error and a warning is logged); reusing an already-running
+     * singleton on the same session still succeeds.
+     *
+     * @defaultValue unlimited
+     */
+    maxInstancesPerUser?: number;
     /**
      * How long an app instance may stay without a client socket before it is destroyed, in milliseconds. The clock starts
      * when the instance's connection is destroyed (the client closed it, or it stayed without a WebSocket for the
@@ -361,27 +371,87 @@ export default class Platform {
             maxPendingStreams: config.maxPendingStreams,
             maxBufferedBytes: config.maxBufferedBytes,
             allowUrlTokenWs: config.allowUrlTokenWs,
+            onDeauth: (info: ClientInfo) => {
+                if (info.clientType === ClientType.User) {
+                    this.destroyRuntimeInstances(info.runtimeId);
+                }
+            },
         });
         this.agentController = new AgentController(this.config.agentIndexPath, undefined, this.workerRequestTimeoutMs);
         this.serve();
     }
 
-    private async withInstanceCreationLock<T>(runtimeId: string, operation: () => Promise<T>): Promise<T> {
-        const previous = this.instanceCreationLocks.get(runtimeId);
+    private async withInstanceCreationLock<T>(lockKey: string, operation: () => Promise<T>): Promise<T> {
+        const previous = this.instanceCreationLocks.get(lockKey);
         let release!: () => void;
         const current = new Promise<void>((resolve) => {
             release = resolve;
         });
-        this.instanceCreationLocks.set(runtimeId, current);
+        this.instanceCreationLocks.set(lockKey, current);
         await previous;
         try {
             return await operation();
         } finally {
             release();
-            if (this.instanceCreationLocks.get(runtimeId) === current) {
-                this.instanceCreationLocks.delete(runtimeId);
+            if (this.instanceCreationLocks.get(lockKey) === current) {
+                this.instanceCreationLocks.delete(lockKey);
             }
         }
+    }
+
+    /** Destroys all running app instances belonging to `runtimeId` and removes the runtime entry. */
+    private destroyRuntimeInstances(runtimeId: string): void {
+        const userInstances = this.instances.get(runtimeId);
+        if (!userInstances) {
+            return;
+        }
+        this.instances.delete(runtimeId);
+        for (const instance of [...userInstances.values()]) {
+            instance.destroy();
+        }
+    }
+
+    /** Destroys all running app instances belonging to `userId` across all runtimes, optionally sparing `exceptRuntimeId`. */
+    private destroyUserInstances(userId: string, exceptRuntimeId?: string): void {
+        for (const [runtimeId, userInstances] of [...this.instances.entries()]) {
+            if (exceptRuntimeId !== undefined && runtimeId === exceptRuntimeId) {
+                continue;
+            }
+            for (const [instanceId, instance] of [...userInstances.entries()]) {
+                if (instance.userId === userId) {
+                    userInstances.delete(instanceId);
+                    instance.destroy();
+                }
+            }
+            if (userInstances.size === 0) {
+                this.instances.delete(runtimeId);
+            }
+        }
+    }
+
+    /**
+     * Immediately closes WebSocket connections and destroys all running app instances belonging to a single session
+     * ({@link ClientInfo.runtimeId}), without affecting other sessions (devices) of the same user.
+     *
+     * @param runtimeId - {@link ClientInfo.runtimeId} of the session to revoke.
+     * @param token - Optional session token filter for WebSocket revocation; when omitted, all sockets of `runtimeId` are closed.
+     */
+    deauthSession(runtimeId: string, token?: string): void {
+        this.endpoint.deauthSession(runtimeId, token);
+        this.destroyRuntimeInstances(runtimeId);
+    }
+
+    /**
+     * Immediately closes all WebSocket connections and destroys all running app instances belonging to `userId` across
+     * all sessions/devices (optionally keeping `exceptRuntimeId` alive, for example the current device after a password
+     * change).
+     *
+     * @param userId - {@link ClientInfo.id} of the user to revoke.
+     * @param exceptRuntimeId - Optional {@link ClientInfo.runtimeId} to keep connected and running.
+     */
+    deauthUser(userId: string, exceptRuntimeId?: string): void {
+        this.endpoint.deauthByUserId(userId, exceptRuntimeId);
+        this.destroyUserInstances(userId, exceptRuntimeId);
     }
 
     /** Starts the accept loops of the `platform`, `instance` and `agent` endpoints. */
@@ -618,8 +688,9 @@ export default class Platform {
 
     /**
      * Serves `createInstance` streams: validates `{ appName, profile }` against the user's app listing, applies
-     * `instanceUserLimit` (evicting the least recently touched non-singletons) and `maxInstances`, starts the instance and
-     * answers its id. Singleton apps reuse an existing instance. Any failure closes the stream with an error.
+     * `instanceUserLimit` (evicting the least recently touched non-singletons), `maxInstancesPerUser` and `maxInstances`,
+     * starts the instance and answers its id. Singleton apps reuse an existing instance. Any failure closes the stream
+     * with an error.
      */
     private processInstanceStream(userId: string, runtimeId: string, endpointSocket: Socket): void {
         const startInstanceArg = t.type({
@@ -632,7 +703,7 @@ export default class Platform {
                 return LoopResult.Stop;
             }
             const stream = streamResult.unwrap();
-            return this.withInstanceCreationLock(runtimeId, async () => {
+            return this.withInstanceCreationLock(userId, async () => {
                 let createdInstance: Instance | undefined;
                 try {
                     if (!startInstanceArg.is(stream.args)) {
@@ -676,6 +747,18 @@ export default class Platform {
                         }
                     } else {
                         evictOldestRegularInstances(instances, this.config.instanceUserLimit, this.singletonApps);
+                    }
+
+                    if (this.config.maxInstancesPerUser !== undefined) {
+                        const userTotal = countUserInstances(this.instances, userId);
+                        if (userTotal >= this.config.maxInstancesPerUser) {
+                            if (instances.size === 0) {
+                                this.instances.delete(runtimeId);
+                            }
+                            logger.warn(`Per-user instance limit reached for user '${userId}' (${userTotal}/${this.config.maxInstancesPerUser}). Rejecting createInstance.`);
+                            stream.closeErr();
+                            return LoopResult.Cont;
+                        }
                     }
 
                     if (this.config.maxInstances !== undefined && this.totalInstances >= this.config.maxInstances) {

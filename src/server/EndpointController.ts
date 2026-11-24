@@ -1,7 +1,7 @@
 import { CloseCodes, Connection, deal, Err, Ok, Result, WsCloseCodes } from '@araminix/lib';
 import { WebSocket } from 'ws';
 
-import { ClientInfo } from './AuthProvider.js';
+import { ClientInfo, ClientType } from './AuthProvider.js';
 import { ConnectRequest } from './ConnectRequest.js';
 
 /** Book-keeping for one connection: the token it was (last) opened with and whether the application accepted it. */
@@ -10,16 +10,20 @@ class ConnectionEntry {
     token: string;
     /** The lib connection that survives reconnects. */
     connection: Connection;
+    /** Authenticated client metadata of the most recent (re)connect. */
+    info: ClientInfo;
     /** `true` once the application accepted the request; reconnects are then re-accepted automatically. */
     accepted: boolean = false;
 
     /**
      * @param token - Session token used to open the connection.
      * @param connection - The lib connection.
+     * @param info - Authenticated client identity.
      */
-    constructor(token: string, connection: Connection) {
+    constructor(token: string, connection: Connection, info: ClientInfo) {
         this.token = token;
         this.connection = connection;
+        this.info = info;
     }
 }
 
@@ -198,12 +202,13 @@ export default class EndpointController {
                 },
                 onAccept: () => {},
             };
-            connectionEntry = new ConnectionEntry(token, new Connection(driver, arg));
+            connectionEntry = new ConnectionEntry(token, new Connection(driver, arg), info);
             this.addConnection(connectionEntry, connectionId, info);
             connectionEntry.connection.connect(ws as any);
             return;
         }
         connectionEntry.token = token;
+        connectionEntry.info = info;
         connectionEntry.connection.connect(ws as any);
         // Only repeat accept_endpoint for connections the app already accepted; pending ones wait for its decision.
         if (connectionEntry.accepted) {
@@ -221,10 +226,56 @@ export default class EndpointController {
      */
     deauthUser<INFO extends ClientInfo>(info: INFO, token: string): void {
         const connectionId = `${info.clientType}/${info.runtimeId}/`;
+        const toDestroy: ConnectionEntry[] = [];
         this.connections.forEach((connectionEntry, id) => {
             if (id.startsWith(connectionId) && connectionEntry.token === token) {
-                connectionEntry.connection.destroy(CloseCodes.Unauthorized);
+                toDestroy.push(connectionEntry);
             }
         });
+        for (const entry of toDestroy) {
+            entry.connection.destroy(CloseCodes.Unauthorized);
+        }
+    }
+
+    /**
+     * Destroys (with `CloseCodes.Unauthorized`) every user connection belonging to `runtimeId`. When `token` is provided,
+     * only connections whose latest token matches `token` are destroyed.
+     *
+     * @param runtimeId - {@link ClientInfo.runtimeId} of the session to revoke.
+     * @param token - Optional session token filter.
+     */
+    deauthSession(runtimeId: string, token?: string): void {
+        const toDestroy: ConnectionEntry[] = [];
+        this.connections.forEach((connectionEntry) => {
+            if (connectionEntry.info.clientType === ClientType.User && connectionEntry.info.runtimeId === runtimeId && (token === undefined || connectionEntry.token === token)) {
+                toDestroy.push(connectionEntry);
+            }
+        });
+        for (const entry of toDestroy) {
+            entry.connection.destroy(CloseCodes.Unauthorized);
+        }
+    }
+
+    /**
+     * Destroys (with `CloseCodes.Unauthorized`) every user connection belonging to `userId` across all runtimes,
+     * optionally sparing connections whose {@link ClientInfo.runtimeId} equals `exceptRuntimeId`.
+     *
+     * @param userId - {@link ClientInfo.id} of the user to revoke.
+     * @param exceptRuntimeId - Optional {@link ClientInfo.runtimeId} to keep connected.
+     */
+    deauthByUserId(userId: string, exceptRuntimeId?: string): void {
+        const toDestroy: ConnectionEntry[] = [];
+        this.connections.forEach((connectionEntry) => {
+            if (
+                connectionEntry.info.clientType === ClientType.User &&
+                connectionEntry.info.id === userId &&
+                (exceptRuntimeId === undefined || connectionEntry.info.runtimeId !== exceptRuntimeId)
+            ) {
+                toDestroy.push(connectionEntry);
+            }
+        });
+        for (const entry of toDestroy) {
+            entry.connection.destroy(CloseCodes.Unauthorized);
+        }
     }
 }

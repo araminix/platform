@@ -2,7 +2,7 @@ import { logger, Result, trimSlash, uuid, wrap, WsCloseCodes } from '@araminix/l
 import axios from 'axios';
 import cookieParser from 'cookie-parser';
 import expressCore, { CookieOptions, NextFunction, Request, Response } from 'express';
-import { ipKeyGenerator, rateLimit } from 'express-rate-limit';
+import { ipKeyGenerator, LegacyStore, rateLimit, Store } from 'express-rate-limit';
 import expressWs from 'express-ws';
 import fs from 'fs';
 import type { Server } from 'http';
@@ -128,6 +128,22 @@ export interface RateLimitConfig {
      * @defaultValue `false`
      */
     skipSuccessfulRequests?: boolean;
+    /**
+     * Custom `express-rate-limit` store (for example a Redis-backed store for horizontally scaled deployments). When the
+     * secondary IP-only ceiling ({@link RateLimitConfig.ipLimit}) is active and {@link RateLimitConfig.ipStore} is not
+     * supplied, the IP ceiling shares this store under an `ip:` key prefix without calling `store.init` a second time.
+     *
+     * @defaultValue in-memory store (`MemoryStore`)
+     */
+    store?: Store | LegacyStore;
+    /**
+     * Optional separate `express-rate-limit` store for the secondary IP-only ceiling limiter
+     * ({@link RateLimitConfig.ipLimit}). When omitted, {@link RateLimitConfig.store} is reused (or a separate
+     * `MemoryStore` when no `store` is supplied).
+     *
+     * @defaultValue reuses {@link RateLimitConfig.store}, or a separate `MemoryStore`
+     */
+    ipStore?: Store | LegacyStore;
 }
 
 /**
@@ -286,6 +302,38 @@ export interface EndpointOptions {
      * @defaultValue `false`
      */
     allowUrlTokenWs?: boolean;
+    /**
+     * Hook invoked after `DELETE /auth` closes a session's WebSocket connections. {@link Platform} uses this to
+     * immediately destroy running worker instances belonging to `info.runtimeId`.
+     *
+     * @defaultValue unset
+     */
+    onDeauth?: (info: ClientInfo, token: string) => void;
+}
+
+function isLegacyRateLimitStore(store: Store | LegacyStore): store is LegacyStore {
+    return typeof (store as LegacyStore).incr === 'function' && typeof (store as Store).increment !== 'function';
+}
+
+/** Wraps an already-initialized store for the secondary IP limiter without triggering a second `store.init()` call. */
+function createSharedRateLimitStore(store: Store | LegacyStore): Store | LegacyStore {
+    if (isLegacyRateLimitStore(store)) {
+        return {
+            incr: (key, callback) => store.incr(key, callback),
+            decrement: (key) => store.decrement(key),
+            resetKey: (key) => store.resetKey(key),
+            ...(store.resetAll ? { resetAll: () => store.resetAll!() } : {}),
+        };
+    }
+    return {
+        localKeys: store.localKeys,
+        prefix: store.prefix,
+        ...(store.get ? { get: (key) => store.get!(key) } : {}),
+        increment: (key) => store.increment(key),
+        decrement: (key) => store.decrement(key),
+        resetKey: (key) => store.resetKey(key),
+        ...(store.resetAll ? { resetAll: () => store.resetAll!() } : {}),
+    };
 }
 
 /** Shape of the ids that `POST /file` generates; other ids are answered with 404 without touching the disk. */
@@ -424,6 +472,8 @@ export default class Endpoint {
     private allowedOrigins?: string[];
     /** Whether deprecated `/ws-token/...` routes are registered. */
     private readonly allowUrlTokenWs: boolean;
+    /** Hook called after `DELETE /auth` closes the session's WebSocket connections. */
+    private onDeauth?: (info: ClientInfo, token: string) => void;
     /** Rate-limit configuration as given. */
     private authRateLimit?: RateLimitConfig | boolean;
     /** Shared rate-limit middleware of the authentication routes (a pass-through when disabled). */
@@ -476,6 +526,7 @@ export default class Endpoint {
         maxPendingStreams,
         maxBufferedBytes,
         allowUrlTokenWs = false,
+        onDeauth,
     }: EndpointOptions) {
         this.authProvider = authProvider;
         this.port = port;
@@ -495,6 +546,7 @@ export default class Endpoint {
         this.googleClientIds = googleClientIds;
         this.allowedOrigins = allowedOrigins;
         this.allowUrlTokenWs = allowUrlTokenWs;
+        this.onDeauth = onDeauth;
         if (this.allowUrlTokenWs) {
             logger.warn('Endpoint: allowUrlTokenWs is enabled. Deprecated /ws-token/... routes expose session tokens in URLs and should only be used temporarily for migration.');
         }
@@ -503,7 +555,7 @@ export default class Endpoint {
         const rateLimitEnabled = this.authRateLimit !== false;
         if (rateLimitEnabled) {
             const customConfig = typeof this.authRateLimit === 'object' ? this.authRateLimit : {};
-            const { ipLimit: configuredIpLimit, max: legacyMax, limit: configuredLimit, ...rateLimitConfig } = customConfig;
+            const { ipLimit: configuredIpLimit, max: legacyMax, limit: configuredLimit, store: configuredStore, ipStore: configuredIpStore, ...rateLimitConfig } = customConfig;
             const windowMs = rateLimitConfig.windowMs ?? 15 * 60 * 1000;
             const accountLimit = configuredLimit ?? legacyMax ?? 100;
             const message = rateLimitConfig.message ?? {
@@ -530,6 +582,7 @@ export default class Endpoint {
                 legacyHeaders: false,
                 validate: { xForwardedForHeader: false, default: false },
                 ...rateLimitConfig,
+                ...(configuredStore ? { store: configuredStore } : {}),
                 windowMs,
                 limit: accountLimit,
                 message,
@@ -537,15 +590,17 @@ export default class Endpoint {
             });
             const effectiveIpLimit = configuredIpLimit !== undefined ? configuredIpLimit : rateLimitConfig.keyGenerator ? 0 : accountLimit * 5;
             if (effectiveIpLimit > 0) {
+                const resolvedIpStore = configuredIpStore ?? (configuredStore ? createSharedRateLimitStore(configuredStore) : undefined);
                 const ipLimiter = rateLimit({
                     standardHeaders: true,
                     legacyHeaders: false,
                     validate: { xForwardedForHeader: false, default: false },
                     ...rateLimitConfig,
+                    ...(resolvedIpStore ? { store: resolvedIpStore } : {}),
                     windowMs,
                     limit: effectiveIpLimit,
                     message,
-                    keyGenerator: (req: Request) => getClientIp(req),
+                    keyGenerator: (req: Request) => `ip:${getClientIp(req)}`,
                 });
                 this.authRateLimiter = (req: Request, res: Response, next: NextFunction) => {
                     ipLimiter(req, res, (err?: unknown) => {
@@ -738,10 +793,43 @@ export default class Endpoint {
         ws.on('close', () => clearInterval(timer));
     }
 
-    /** Destroys every WebSocket connection of `info` that was opened with `token`, on all endpoints. */
+    /** Destroys every WebSocket connection of `info` that was opened with `token`, on all endpoints, and invokes `onDeauth`. */
     private deauth(info: ClientInfo, token: string): void {
         this.endpoints.forEach((endpoint) => {
             endpoint.deauthUser(info, token);
+        });
+        if (this.onDeauth) {
+            try {
+                this.onDeauth(info, token);
+            } catch (err) {
+                logger.error('Error in Endpoint onDeauth hook:', err);
+            }
+        }
+    }
+
+    /**
+     * Destroys (with `CloseCodes.Unauthorized`) every user WebSocket connection belonging to `runtimeId` across all
+     * declared endpoints. When `token` is provided, only connections opened with that token are closed.
+     *
+     * @param runtimeId - {@link ClientInfo.runtimeId} of the session to revoke.
+     * @param token - Optional session token filter.
+     */
+    deauthSession(runtimeId: string, token?: string): void {
+        this.endpoints.forEach((endpoint) => {
+            endpoint.deauthSession(runtimeId, token);
+        });
+    }
+
+    /**
+     * Destroys (with `CloseCodes.Unauthorized`) every user WebSocket connection belonging to `userId` across all
+     * declared endpoints, optionally sparing `exceptRuntimeId`.
+     *
+     * @param userId - {@link ClientInfo.id} of the user to revoke.
+     * @param exceptRuntimeId - Optional {@link ClientInfo.runtimeId} to keep connected.
+     */
+    deauthByUserId(userId: string, exceptRuntimeId?: string): void {
+        this.endpoints.forEach((endpoint) => {
+            endpoint.deauthByUserId(userId, exceptRuntimeId);
         });
     }
 
