@@ -31,13 +31,16 @@ const POLICY_VIOLATION = 1008; // WebSocket close code; the client library retri
 
 /**
  * Limits applied by an {@link EndpointController}. {@link Endpoint} builds them from
- * {@link EndpointOptions.maxConnectionsPerClient} and {@link EndpointOptions.maxPendingStreams}.
+ * {@link EndpointOptions.maxConnectionsPerClient}, {@link EndpointOptions.maxPendingStreams} and
+ * {@link EndpointOptions.maxBufferedBytes}.
  */
 export interface EndpointControllerOptions {
     /** Distinct connections (args) one client may hold on this endpoint; 0 disables the cap. Default 32. */
     maxConnectionsPerClient?: number;
     /** Unaccepted stream requests per connection (needs @araminix/lib >= 1.4); 0 disables the cap. Default 64. */
     maxPendingStreams?: number;
+    /** Maximum bytes buffered on a connection's WebSocket before outgoing writes are rejected (needs @araminix/lib >= 3.2); 0 disables backpressure checks. Default unset (lib default: 4 MiB). */
+    maxBufferedBytes?: number;
 }
 
 /**
@@ -76,13 +79,16 @@ export default class EndpointController {
     private readonly maxConnectionsPerClient: number;
     /** Effective pending-stream cap per connection (0 = unlimited). */
     private readonly maxPendingStreams: number;
+    /** Effective outbound WebSocket buffer cap in bytes (`0` = disabled, `undefined` = lib default). */
+    private readonly maxBufferedBytes?: number;
 
     /**
-     * @param options - Connection and stream limits; omitted fields use the defaults (32 and 64).
+     * @param options - Connection, stream and buffer limits; omitted fields use the defaults (32, 64 and lib default).
      */
     constructor(options: EndpointControllerOptions = {}) {
         this.maxConnectionsPerClient = options.maxConnectionsPerClient ?? DEFAULT_MAX_CONNECTIONS_PER_CLIENT;
         this.maxPendingStreams = options.maxPendingStreams ?? DEFAULT_MAX_PENDING_STREAMS;
+        this.maxBufferedBytes = options.maxBufferedBytes;
     }
 
     /** Counts the registered connections whose id starts with `clientId/` (`clientType/runtimeId`). */
@@ -159,6 +165,7 @@ export default class EndpointController {
             }
             const driver = {
                 maxPendingStreams: this.maxPendingStreams > 0 ? this.maxPendingStreams : undefined,
+                maxBufferedBytes: this.maxBufferedBytes,
                 onDisconnect: (code: number) => {
                     switch (code) {
                         case WsCloseCodes.ConcurrentConnection: {

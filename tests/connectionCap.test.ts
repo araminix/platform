@@ -71,8 +71,14 @@ describe('Per-client connection cap', () => {
         await controller.connect(mockWs(), 'token', new AgentInfo('carol', 'typeX'), 'a');
         const entry = [...(controller as any).connections.values()][0];
         assert.strictEqual(entry.connection.inter.maxPendingStreams, 64);
+        assert.strictEqual(entry.connection.inter.maxBufferedBytes, undefined);
 
-        const unlimited = new EndpointController({ maxConnectionsPerClient: 0, maxPendingStreams: 0 });
+        const buffered = new EndpointController({ maxBufferedBytes: 512 * 1024 });
+        await buffered.connect(mockWs(), 'token', new AgentInfo('eve', 'typeX'), 'a');
+        const bufferedEntry = [...(buffered as any).connections.values()][0];
+        assert.strictEqual(bufferedEntry.connection.inter.maxBufferedBytes, 512 * 1024);
+
+        const unlimited = new EndpointController({ maxConnectionsPerClient: 0, maxPendingStreams: 0, maxBufferedBytes: 0 });
         for (let i = 0; i < 40; i++) {
             const ws = mockWs();
             await unlimited.connect(ws, 'token', new AgentInfo('dave', 'typeX'), `arg-${i}`);
@@ -80,8 +86,9 @@ describe('Per-client connection cap', () => {
         }
         const unlimitedEntry = [...(unlimited as any).connections.values()][0];
         assert.strictEqual(unlimitedEntry.connection.inter.maxPendingStreams, undefined);
+        assert.strictEqual(unlimitedEntry.connection.inter.maxBufferedBytes, 0);
 
-        for (const c of [controller, unlimited]) {
+        for (const c of [controller, buffered, unlimited]) {
             (c as any).connections.forEach((e: any) => e.connection.destroy('Intentional'));
         }
     });
@@ -95,6 +102,7 @@ describe('Per-client connection cap', () => {
             cookieSecret: 'secret',
             maxConnectionsPerClient: 3,
             maxPendingStreams: 7,
+            maxBufferedBytes: 2048,
             maxMessageBytes: 1024,
         });
         // Platform's accept loops declare their endpoints on the next tick.
@@ -102,6 +110,7 @@ describe('Per-client connection cap', () => {
         const controller = (platform.endpoint as any).endpoints.get('platform');
         assert.strictEqual(controller.maxConnectionsPerClient, 3);
         assert.strictEqual(controller.maxPendingStreams, 7);
+        assert.strictEqual(controller.maxBufferedBytes, 2048);
         assert.strictEqual((platform.endpoint as any).wsInstance.getWss().options.maxPayload, 1024);
         platform.stop();
     });

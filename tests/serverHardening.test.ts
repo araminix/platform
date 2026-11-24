@@ -3,6 +3,7 @@ import { Err, Ok } from '@araminix/lib';
 import express from 'express';
 import assert from 'node:assert';
 import fs from 'node:fs';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
@@ -109,11 +110,33 @@ describe('Endpoint hardening', () => {
         endpoint.open();
         try {
             const port = (endpoint as any).server.address().port;
-            const ws = new WebSocket(`ws://127.0.0.1:${port}/ws-token/user-token/svc`);
-            const code = await new Promise<number>((resolve) => {
-                ws.addEventListener('open', () => ws.send('x'.repeat(1000)));
-                ws.addEventListener('close', (event) => resolve(event.code));
-                ws.addEventListener('error', () => {});
+            const code = await new Promise<number>((resolve, reject) => {
+                const req = http.request({
+                    port,
+                    path: '/ws/svc',
+                    agent: false,
+                    headers: {
+                        Connection: 'Upgrade',
+                        Upgrade: 'websocket',
+                        'Sec-WebSocket-Version': '13',
+                        'Sec-WebSocket-Key': 'dGhlIHNhbXBsZSBub25jZQ==',
+                        'x-token': 'user-token',
+                    },
+                });
+                req.on('error', reject);
+                req.on('upgrade', (_res, socket) => {
+                    const payload = Buffer.alloc(1000, 'x');
+                    const header = Buffer.from([0x81, 0xfe, (payload.length >> 8) & 0xff, payload.length & 0xff, 0, 0, 0, 0]);
+                    socket.on('data', (chunk) => {
+                        const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+                        if (buf.length >= 4 && (buf[0] & 0x0f) === 0x08) {
+                            resolve(buf.readUInt16BE(2));
+                            socket.destroy();
+                        }
+                    });
+                    socket.write(Buffer.concat([header, payload]));
+                });
+                req.end();
             });
             assert.strictEqual(code, 1009);
         } finally {

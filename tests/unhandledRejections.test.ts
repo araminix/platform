@@ -1,6 +1,7 @@
 import { deal, err, Ok, ok, StreamCloseCodes, WsCloseCodes } from '@araminix/lib';
 import assert from 'node:assert';
 import fs from 'node:fs';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, it } from 'node:test';
@@ -91,12 +92,34 @@ describe('Unhandled Rejections and Uncaught Exceptions Defense', () => {
         const address = (endpoint as any).server?.address();
         const port = typeof address === 'object' && address ? address.port : 3000;
 
-        const [closePromise, resolveClose] = deal<{ code: number; reason: string }>();
+        const [closePromise, resolveClose] = deal<{ code: number }>();
 
-        const ws = new WebSocket(`ws://127.0.0.1:${port}/ws-token/some-token/platform`);
-        ws.onclose = (event) => {
-            resolveClose({ code: event.code, reason: event.reason });
-        };
+        const req = http.request({
+            port,
+            path: '/ws/platform',
+            agent: false,
+            headers: {
+                Connection: 'Upgrade',
+                Upgrade: 'websocket',
+                'Sec-WebSocket-Version': '13',
+                'Sec-WebSocket-Key': 'dGhlIHNhbXBsZSBub25jZQ==',
+                'x-token': 'some-token',
+            },
+        });
+        req.on('upgrade', (_res, socket, head) => {
+            const inspect = (chunk: string | Buffer) => {
+                const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+                if (buf.length >= 4 && (buf[0] & 0x0f) === 0x08) {
+                    resolveClose({ code: buf.readUInt16BE(2) });
+                    socket.destroy();
+                }
+            };
+            if (head && head.length > 0) {
+                inspect(head);
+            }
+            socket.on('data', inspect);
+        });
+        req.end();
 
         try {
             const result = await closePromise;

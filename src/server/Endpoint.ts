@@ -100,6 +100,14 @@ export interface RateLimitConfig {
      */
     limit?: number;
     /**
+     * Per-IP request ceiling across all authentication routes in the window, enforced alongside the per-account
+     * limiter so an IP cannot bypass limits by randomizing `accountName`. Ignored if a custom {@link keyGenerator} is
+     * supplied without explicitly setting `ipLimit`. `0` disables the secondary IP-only ceiling.
+     *
+     * @defaultValue `5 * (limit ?? max ?? 100)`
+     */
+    ipLimit?: number;
+    /**
      * Body of the 429 response.
      *
      * @defaultValue `{ message: 'Too many authentication attempts, please try again later.', error: 'Too many requests' }`
@@ -108,9 +116,10 @@ export interface RateLimitConfig {
     /**
      * Computes the counter key of a request.
      *
-     * @defaultValue the client IP (`req.ip`, so configure {@link EndpointOptions.trustProxy} behind a proxy), joined with the
-     *     account named in the JSON body (`accountName`, `username`, `email`, `account` or `old_token`) when present:
-     *     `"<ip>:<account>"`.
+     * @defaultValue the normalized client IP (`req.ip`, so configure {@link EndpointOptions.trustProxy} behind a proxy);
+     *     on `POST /auth` and `POST /2fa/verify`, joined with the normalized account named in the JSON body (`accountName`,
+     *     `username`, `email` or `account`) when present: `"<ip>:<account>"`. `PUT /auth/refresh` and other routes key
+     *     strictly on the client IP.
      */
     keyGenerator?: (req: Request, res: Response) => string | Promise<string>;
     /**
@@ -215,9 +224,10 @@ export interface EndpointOptions {
     googleClientIds?: string[];
     /**
      * Browser origins allowed to open WebSockets (protection against cross-site WebSocket hijacking). Matching ignores case
-     * and trailing slashes; `'*'` allows every origin. Requests without an `Origin` header (native and Node.js clients) are
-     * always allowed. When unset or empty, every request that carries an `Origin` is refused (fail closed). This option does
-     * not add CORS headers to HTTP routes.
+     * and trailing slashes; `'*'` allows every origin. Requests without an `Origin` header are allowed only for non-cookie
+     * clients (for example `x-token` header upgrades used by agents); when `allowedOrigins` is configured, cookie-bearing
+     * WebSocket upgrades without an `Origin` header are rejected. When unset or empty, every request that carries an `Origin`
+     * is refused (fail closed). This option does not add CORS headers to HTTP routes.
      *
      * @defaultValue unset (browsers cannot connect)
      */
@@ -262,6 +272,20 @@ export interface EndpointOptions {
      * @defaultValue `64`
      */
     maxPendingStreams?: number;
+    /**
+     * Maximum bytes buffered on a connection's WebSocket (`ws.bufferedAmount`) before outgoing writes are rejected by
+     * `@araminix/lib` backpressure. `0` disables backpressure checks; when unset, `@araminix/lib` uses its default (4 MiB).
+     *
+     * @defaultValue unset (`@araminix/lib` default: `4194304` / 4 MiB)
+     */
+    maxBufferedBytes?: number;
+    /**
+     * Enables the deprecated `/ws-token/:token/:endpoint[/:arg]` routes that pass session tokens in the URL path.
+     * Disabled by default because tokens in URLs leak into access logs, proxy logs and browser history.
+     *
+     * @defaultValue `false`
+     */
+    allowUrlTokenWs?: boolean;
 }
 
 /** Shape of the ids that `POST /file` generates; other ids are answered with 404 without touching the disk. */
@@ -343,7 +367,7 @@ function validateToken(req: CustomRequest, res: Response, next: NextFunction): v
  * - `POST /attachments/upload`, `GET /attachments/:attachmentId`, `GET /attachments/:userId/:fileName` - MinIO presigned
  *   URLs (only with `minio`).
  * - `POST /mobile/:module/:action` - forwarded to {@link AuthProvider.mobileRequests}.
- * - `WS /ws/:endpoint[/:arg]` - named endpoints; `WS /ws-token/:token/:endpoint[/:arg]` is deprecated (token in the URL).
+ * - `WS /ws/:endpoint[/:arg]` - named endpoints; deprecated `WS /ws-token/:token/:endpoint[/:arg]` is disabled by default unless {@link EndpointOptions.allowUrlTokenWs} is set.
  *
  * @remarks
  * Middleware order: cookie parser, JSON body parser, access log ({@link logMiddleware}), session lookup, then the routes
@@ -398,6 +422,8 @@ export default class Endpoint {
     private googleClientIds?: string[];
     /** Browser origins allowed to open WebSockets. */
     private allowedOrigins?: string[];
+    /** Whether deprecated `/ws-token/...` routes are registered. */
+    private readonly allowUrlTokenWs: boolean;
     /** Rate-limit configuration as given. */
     private authRateLimit?: RateLimitConfig | boolean;
     /** Shared rate-limit middleware of the authentication routes (a pass-through when disabled). */
@@ -448,6 +474,8 @@ export default class Endpoint {
         trustProxy,
         maxConnectionsPerClient,
         maxPendingStreams,
+        maxBufferedBytes,
+        allowUrlTokenWs = false,
     }: EndpointOptions) {
         this.authProvider = authProvider;
         this.port = port;
@@ -458,7 +486,7 @@ export default class Endpoint {
         }
         this.cookieSecret = cookieSecret || uuid();
         this.heartbeatIntervalMs = heartbeatIntervalMs;
-        this.controllerOptions = { maxConnectionsPerClient, maxPendingStreams };
+        this.controllerOptions = { maxConnectionsPerClient, maxPendingStreams, maxBufferedBytes };
         this.sessionTtl = sessionTtl;
         this.uploadDir = uploadDir;
         this.minio = minio;
@@ -466,31 +494,71 @@ export default class Endpoint {
         this.uploadAllowlist = uploadAllowlist;
         this.googleClientIds = googleClientIds;
         this.allowedOrigins = allowedOrigins;
+        this.allowUrlTokenWs = allowUrlTokenWs;
+        if (this.allowUrlTokenWs) {
+            logger.warn('Endpoint: allowUrlTokenWs is enabled. Deprecated /ws-token/... routes expose session tokens in URLs and should only be used temporarily for migration.');
+        }
         this.authRateLimit = authRateLimit;
 
         const rateLimitEnabled = this.authRateLimit !== false;
         if (rateLimitEnabled) {
             const customConfig = typeof this.authRateLimit === 'object' ? this.authRateLimit : {};
-            this.authRateLimiter = rateLimit({
-                windowMs: customConfig.windowMs ?? 15 * 60 * 1000,
-                limit: customConfig.limit ?? customConfig.max ?? 100,
+            const { ipLimit: configuredIpLimit, max: legacyMax, limit: configuredLimit, ...rateLimitConfig } = customConfig;
+            const windowMs = rateLimitConfig.windowMs ?? 15 * 60 * 1000;
+            const accountLimit = configuredLimit ?? legacyMax ?? 100;
+            const message = rateLimitConfig.message ?? {
+                message: 'Too many authentication attempts, please try again later.',
+                error: 'Too many requests',
+            };
+            const accountKeyedPaths = new Set([`${this.mount}/auth`, `${this.mount}/2fa/verify`]);
+            const getClientIp = (req: Request): string => {
+                const rawIp = req.ip || req.socket?.remoteAddress || '127.0.0.1';
+                return ipKeyGenerator(typeof rawIp === 'string' ? rawIp : '127.0.0.1');
+            };
+            const defaultKeyGenerator = (req: Request): string => {
+                const ip = getClientIp(req);
+                const normalizedPath = req.path.replace(/\/+$/, '');
+                if (!accountKeyedPaths.has(normalizedPath)) {
+                    return ip;
+                }
+                const rawAccount = req.body?.accountName ?? req.body?.username ?? req.body?.email ?? req.body?.account;
+                const account = typeof rawAccount === 'string' ? rawAccount.trim().toLowerCase() : '';
+                return account ? `${ip}:${account}` : ip;
+            };
+            const accountLimiter = rateLimit({
                 standardHeaders: true,
                 legacyHeaders: false,
                 validate: { xForwardedForHeader: false, default: false },
-                message: customConfig.message ?? {
-                    message: 'Too many authentication attempts, please try again later.',
-                    error: 'Too many requests',
-                },
-                keyGenerator:
-                    customConfig.keyGenerator ??
-                    ((req: Request) => {
-                        const rawIp = req.ip || req.socket?.remoteAddress || req.headers['x-forwarded-for'] || '127.0.0.1';
-                        const ip = ipKeyGenerator(typeof rawIp === 'string' ? rawIp : Array.isArray(rawIp) ? rawIp[0] : '127.0.0.1');
-                        const account = req.body?.accountName || req.body?.username || req.body?.email || req.body?.account || req.body?.old_token || '';
-                        return account ? `${ip}:${account}` : ip;
-                    }),
-                ...customConfig,
+                ...rateLimitConfig,
+                windowMs,
+                limit: accountLimit,
+                message,
+                keyGenerator: rateLimitConfig.keyGenerator ?? defaultKeyGenerator,
             });
+            const effectiveIpLimit = configuredIpLimit !== undefined ? configuredIpLimit : rateLimitConfig.keyGenerator ? 0 : accountLimit * 5;
+            if (effectiveIpLimit > 0) {
+                const ipLimiter = rateLimit({
+                    standardHeaders: true,
+                    legacyHeaders: false,
+                    validate: { xForwardedForHeader: false, default: false },
+                    ...rateLimitConfig,
+                    windowMs,
+                    limit: effectiveIpLimit,
+                    message,
+                    keyGenerator: (req: Request) => getClientIp(req),
+                });
+                this.authRateLimiter = (req: Request, res: Response, next: NextFunction) => {
+                    ipLimiter(req, res, (err?: unknown) => {
+                        if (err) {
+                            next(err);
+                            return;
+                        }
+                        accountLimiter(req, res, next);
+                    });
+                };
+            } else {
+                this.authRateLimiter = accountLimiter;
+            }
         } else {
             this.authRateLimiter = (_req: Request, _res: Response, next: NextFunction) => next();
         }
@@ -507,8 +575,13 @@ export default class Endpoint {
         const wsOptions: any = {
             maxPayload: maxMessageBytes,
             verifyClient: (info: any, cb: (res: boolean, code?: number, message?: string) => void) => {
+                const rawUrl = typeof info.req?.url === 'string' ? info.req.url : '';
+                const pathname = rawUrl.split('?')[0];
+                if (!this.allowUrlTokenWs && (pathname === `${this.mount}/ws-token` || pathname.startsWith(`${this.mount}/ws-token/`))) {
+                    return cb(false, 404, 'Not Found');
+                }
                 const origin = info.origin || info.req?.headers?.origin || info.req?.headers?.['sec-websocket-origin'];
-                const allowed = this.checkOrigin(origin);
+                const allowed = this.checkOrigin(origin, this.hasCookie(info.req));
                 if (allowed) {
                     return cb(true);
                 }
@@ -523,9 +596,34 @@ export default class Endpoint {
         this.init();
     }
 
-    /** Applies the {@link EndpointOptions.allowedOrigins} policy to an `Origin` header value (absent origin = allowed). */
-    private checkOrigin(origin?: string): boolean {
+    /** Returns `true` when the request carries a `Cookie` header or a parsed signed `token` cookie. */
+    private hasCookie(req?: Request | any): boolean {
+        if (!req) {
+            return false;
+        }
+        if (req.signedCookies?.token) {
+            return true;
+        }
+        const cookieHeader = req.headers?.cookie;
+        if (typeof cookieHeader === 'string') {
+            return cookieHeader.trim().length > 0;
+        }
+        if (Array.isArray(cookieHeader)) {
+            return cookieHeader.some((value) => typeof value === 'string' && value.trim().length > 0);
+        }
+        return false;
+    }
+
+    /**
+     * Applies the {@link EndpointOptions.allowedOrigins} policy to an `Origin` header value. Absent `Origin` is allowed
+     * only for non-cookie requests; when `hasCookie` is `true` and `allowedOrigins` is configured, absent `Origin` is
+     * rejected.
+     */
+    private checkOrigin(origin?: string, hasCookie = false): boolean {
         if (!origin) {
+            if (hasCookie && this.allowedOrigins && this.allowedOrigins.length > 0) {
+                return false;
+            }
             return true;
         }
         if (!this.allowedOrigins || this.allowedOrigins.length === 0) {
@@ -543,7 +641,7 @@ export default class Endpoint {
     /** Applies {@link Endpoint.checkOrigin} to the `Origin` (or `Sec-WebSocket-Origin`) header of a request. */
     private isOriginAllowed(req: Request | any): boolean {
         const origin = req.headers?.origin || req.headers?.['sec-websocket-origin'];
-        return this.checkOrigin(origin);
+        return this.checkOrigin(origin, this.hasCookie(req));
     }
 
     /** Installs the middleware and the routes, in order. */
@@ -660,9 +758,21 @@ export default class Endpoint {
             const headerToken = req.header('x-token');
             req.token = cookieToken ? cookieToken : headerToken ? headerToken : undefined;
             if (req.token) {
-                const result = await this.authProvider.getInfo(req.token);
-                if (result.isOk()) {
-                    req.info = result.unwrap();
+                try {
+                    const result = await this.authProvider.getInfo(req.token);
+                    if (result.isOk()) {
+                        req.info = result.unwrap();
+                    }
+                } catch (err) {
+                    logger.error('Session lookup failed in authProvider.getInfo:', err);
+                    const ws = (req as any).ws;
+                    if (ws && typeof ws.close === 'function') {
+                        try {
+                            ws.close(WsCloseCodes.InternalError);
+                        } catch {}
+                        return;
+                    }
+                    return next(err);
                 }
             }
             return next();
@@ -675,59 +785,61 @@ export default class Endpoint {
      * (unexpected error).
      */
     private initWs(): void {
-        /**
-         * @deprecated Use /ws/:endpoint/:arg with cookie or x-token header instead.
-         */
-        this.express.ws(`${this.mount}/ws-token/:token/:endpoint/:arg`, async (ws, req: any) => {
-            try {
-                if (!this.isOriginAllowed(req)) {
-                    ws.close(WsCloseCodes.Denied);
-                    return;
-                }
-                const token = String(req.params.token);
-                const endpointName = String(req.params.endpoint);
-                const arg = String(req.params.arg ?? '');
-                const result = await this.authProvider.getInfo(token);
-                if (result.isErr()) {
-                    ws.close(WsCloseCodes.Unauthorized);
-                    return;
-                }
-                const clientInfo = result.unwrap();
-                await this.handle(token, clientInfo, endpointName, arg, ws);
-            } catch (err) {
-                logger.error('Unhandled rejection in /ws-token/:token/:endpoint/:arg:', err);
+        if (this.allowUrlTokenWs) {
+            /**
+             * @deprecated Use /ws/:endpoint/:arg with cookie or x-token header instead.
+             */
+            this.express.ws(`${this.mount}/ws-token/:token/:endpoint/:arg`, async (ws, req: any) => {
                 try {
-                    ws.close(WsCloseCodes.InternalError);
-                } catch {}
-            }
-        });
+                    if (!this.isOriginAllowed(req)) {
+                        ws.close(WsCloseCodes.Denied);
+                        return;
+                    }
+                    const token = String(req.params.token);
+                    const endpointName = String(req.params.endpoint);
+                    const arg = String(req.params.arg ?? '');
+                    const result = await this.authProvider.getInfo(token);
+                    if (result.isErr()) {
+                        ws.close(WsCloseCodes.Unauthorized);
+                        return;
+                    }
+                    const clientInfo = result.unwrap();
+                    await this.handle(token, clientInfo, endpointName, arg, ws);
+                } catch (err) {
+                    logger.error('Unhandled rejection in /ws-token/:token/:endpoint/:arg:', err);
+                    try {
+                        ws.close(WsCloseCodes.InternalError);
+                    } catch {}
+                }
+            });
 
-        /**
-         * @deprecated Use /ws/:endpoint with cookie or x-token header instead.
-         */
-        this.express.ws(`${this.mount}/ws-token/:token/:endpoint`, async (ws, req: any) => {
-            try {
-                if (!this.isOriginAllowed(req)) {
-                    ws.close(WsCloseCodes.Denied);
-                    return;
-                }
-                const token = String(req.params.token);
-                const endpointName = String(req.params.endpoint);
-                const arg = '';
-                const result = await this.authProvider.getInfo(token);
-                if (result.isErr()) {
-                    ws.close(WsCloseCodes.Unauthorized);
-                    return;
-                }
-                const info = result.unwrap();
-                await this.handle(token, info, endpointName, arg, ws);
-            } catch (err) {
-                logger.error('Unhandled rejection in /ws-token/:token/:endpoint:', err);
+            /**
+             * @deprecated Use /ws/:endpoint with cookie or x-token header instead.
+             */
+            this.express.ws(`${this.mount}/ws-token/:token/:endpoint`, async (ws, req: any) => {
                 try {
-                    ws.close(WsCloseCodes.InternalError);
-                } catch {}
-            }
-        });
+                    if (!this.isOriginAllowed(req)) {
+                        ws.close(WsCloseCodes.Denied);
+                        return;
+                    }
+                    const token = String(req.params.token);
+                    const endpointName = String(req.params.endpoint);
+                    const arg = '';
+                    const result = await this.authProvider.getInfo(token);
+                    if (result.isErr()) {
+                        ws.close(WsCloseCodes.Unauthorized);
+                        return;
+                    }
+                    const info = result.unwrap();
+                    await this.handle(token, info, endpointName, arg, ws);
+                } catch (err) {
+                    logger.error('Unhandled rejection in /ws-token/:token/:endpoint:', err);
+                    try {
+                        ws.close(WsCloseCodes.InternalError);
+                    } catch {}
+                }
+            });
+        }
 
         /** Preferred route: authenticated by the session cookie or the `x-token` upgrade header; `arg` is passed to the endpoint. */
         this.express.ws(`${this.mount}/ws/:endpoint/:arg`, async (ws, req: CustomRequest) => {

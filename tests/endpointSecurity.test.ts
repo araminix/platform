@@ -194,7 +194,7 @@ describe('Endpoint Session Cookie and Header Security', () => {
         assert.strictEqual(closeResult.closed, true);
     });
 
-    it('maintains backward compatibility for /ws-token/:token/:endpoint route', async () => {
+    it('rejects deprecated /ws-token routes by default', async () => {
         endpoint = new Endpoint({
             authProvider: mockAuth,
             port: 0,
@@ -206,11 +206,75 @@ describe('Endpoint Session Cookie and Header Security', () => {
         const address = (endpoint as any).server?.address();
         const port = typeof address === 'object' && address ? address.port : 3000;
 
+        for (const wsPath of ['/ws-token/valid-token/legacy', '/ws-token/valid-token/legacy/arg-1']) {
+            const [resultPromise, resolveResult] = deal<{ statusCode: number }>();
+
+            const req = http.request({
+                port,
+                path: wsPath,
+                agent: false,
+                headers: {
+                    Connection: 'Upgrade',
+                    Upgrade: 'websocket',
+                    'Sec-WebSocket-Version': '13',
+                    'Sec-WebSocket-Key': 'dGhlIHNhbXBsZSBub25jZQ==',
+                },
+            });
+
+            req.on('response', (res) => {
+                resolveResult({ statusCode: res.statusCode || 404 });
+            });
+
+            req.on('upgrade', (_res, socket) => {
+                socket.destroy();
+                resolveResult({ statusCode: 101 });
+            });
+
+            req.end();
+
+            const result = await resultPromise;
+            assert.strictEqual(result.statusCode, 404, `${wsPath} must be rejected with 404 by default`);
+        }
+    });
+
+    it('allows /ws-token/:token/:endpoint when allowUrlTokenWs is enabled and logs a warning', async () => {
+        const logs: string[] = [];
+        const originalWarn = console.warn;
+        const originalLog = console.log;
+        const originalError = console.error;
+        console.warn = (...args: unknown[]) => logs.push(args.map(String).join(' '));
+        console.log = (...args: unknown[]) => logs.push(args.map(String).join(' '));
+        console.error = (...args: unknown[]) => logs.push(args.map(String).join(' '));
+        try {
+            endpoint = new Endpoint({
+                authProvider: mockAuth,
+                port: 0,
+                cookieSecret: 'test-secret',
+                cookieOptions: { secure: false },
+                allowUrlTokenWs: true,
+            });
+        } finally {
+            console.warn = originalWarn;
+            console.log = originalLog;
+            console.error = originalError;
+        }
+        assert.ok(
+            logs.some((line) => line.includes('allowUrlTokenWs')),
+            'Enabling allowUrlTokenWs must log a startup warning',
+        );
+
+        endpoint.declare('legacy');
+        endpoint.open();
+
+        const address = (endpoint as any).server?.address();
+        const port = typeof address === 'object' && address ? address.port : 3000;
+
         const [upgradePromise, resolveUpgrade] = deal<{ statusCode: number }>();
 
         const req = http.request({
             port,
             path: '/ws-token/valid-token/legacy',
+            agent: false,
             headers: {
                 Connection: 'Upgrade',
                 Upgrade: 'websocket',
@@ -858,6 +922,57 @@ describe('Endpoint Cross-Site WebSocket Hijacking Protection', () => {
         const rejectResult = await rejectPromise;
         assert.strictEqual(rejectResult.statusCode, 403);
     });
+
+    it('rejects cookie-bearing WebSocket upgrade without Origin header when allowedOrigins is configured', async () => {
+        endpoint = new Endpoint({
+            authProvider: mockAuth,
+            port: 0,
+            cookieOptions: { secure: false },
+            allowedOrigins: ['https://app.example.com'],
+        });
+        endpoint.declare('agent');
+        endpoint.open();
+
+        const authRes = await request(endpoint.express).post('/auth').send({ username: 'john' });
+        const cookie = authRes.headers['set-cookie']?.[0]?.split(';')[0];
+        assert.ok(cookie, 'Cookie must be set');
+
+        const address = (endpoint as any).server?.address();
+        const port = typeof address === 'object' && address ? address.port : 3000;
+
+        const [rejectPromise, resolveReject] = deal<{ statusCode: number }>();
+
+        const req = http.request({
+            port,
+            path: '/ws/agent',
+            agent: false,
+            headers: {
+                Connection: 'Upgrade',
+                Upgrade: 'websocket',
+                'Sec-WebSocket-Version': '13',
+                'Sec-WebSocket-Key': 'dGhlIHNhbXBsZSBub25jZQ==',
+                Cookie: cookie,
+            },
+        });
+
+        req.on('response', (res) => {
+            resolveReject({ statusCode: res.statusCode || 403 });
+        });
+
+        req.on('upgrade', (_res, socket) => {
+            socket.destroy();
+            resolveReject({ statusCode: 101 });
+        });
+
+        req.end();
+
+        const rejectResult = await rejectPromise;
+        assert.strictEqual(rejectResult.statusCode, 403);
+
+        // Defense-in-depth check on isOriginAllowed for signedCookies without Origin
+        assert.strictEqual((endpoint as any).isOriginAllowed({ headers: {}, signedCookies: { token: 'valid-token' } }), false);
+        assert.strictEqual((endpoint as any).isOriginAllowed({ headers: { 'x-token': 'valid-token' } }), true);
+    });
 });
 
 describe('Endpoint CSRF Defense for Cookie-Authenticated Mutations', () => {
@@ -1135,7 +1250,7 @@ describe('Endpoint Login and 2FA Hardening', () => {
         assert.strictEqual(resUserB.status, 200);
     });
 
-    it('enforces rate limiting on /auth/refresh keyed by IP and account', async () => {
+    it('enforces IP-only rate limiting on /auth/refresh even when old_token varies', async () => {
         endpoint = new Endpoint({
             authProvider: mockAuth,
             port: 0,
@@ -1145,14 +1260,33 @@ describe('Endpoint Login and 2FA Hardening', () => {
         const res1 = await request(endpoint.express).put('/auth/refresh').send({ old_token: 'tokenA' });
         assert.strictEqual(res1.status, 200);
 
-        const res2 = await request(endpoint.express).put('/auth/refresh').send({ old_token: 'tokenA' });
+        const res2 = await request(endpoint.express).put('/auth/refresh').send({ old_token: 'tokenB' });
         assert.strictEqual(res2.status, 200);
 
-        const res3 = await request(endpoint.express).put('/auth/refresh').send({ old_token: 'tokenA' });
+        const res3 = await request(endpoint.express).put('/auth/refresh').send({ old_token: 'tokenC' });
         assert.strictEqual(res3.status, 429);
 
-        const resTokenB = await request(endpoint.express).put('/auth/refresh').send({ old_token: 'tokenB' });
-        assert.strictEqual(resTokenB.status, 200);
+        // Passing an accountName in /auth/refresh body must not bypass IP-only keying
+        const res4 = await request(endpoint.express).put('/auth/refresh').send({ old_token: 'tokenD', accountName: 'otherUser' });
+        assert.strictEqual(res4.status, 429);
+    });
+
+    it('enforces IP-only ceiling on /auth so randomizing accountName cannot bypass rate limits', async () => {
+        endpoint = new Endpoint({
+            authProvider: mockAuth,
+            port: 0,
+            authRateLimit: { limit: 2, ipLimit: 4, windowMs: 60000 },
+        });
+
+        for (let i = 1; i <= 4; i++) {
+            const res = await request(endpoint.express)
+                .post('/auth')
+                .send({ accountName: `random-user-${i}` });
+            assert.strictEqual(res.status, 200);
+        }
+
+        const blocked = await request(endpoint.express).post('/auth').send({ accountName: 'random-user-5' });
+        assert.strictEqual(blocked.status, 429);
     });
 
     it('allows rate limiting to be disabled via authRateLimit: false', async () => {

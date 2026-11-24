@@ -213,6 +213,18 @@ export interface PlatformConfig {
      */
     maxPendingStreams?: number;
     /**
+     * See {@link EndpointOptions.maxBufferedBytes}.
+     *
+     * @defaultValue unset (`@araminix/lib` default: 4 MiB)
+     */
+    maxBufferedBytes?: number;
+    /**
+     * See {@link EndpointOptions.allowUrlTokenWs}.
+     *
+     * @defaultValue `false`
+     */
+    allowUrlTokenWs?: boolean;
+    /**
      * Handlers for your own streams on the `platform` connection, by name. A client opens a stream named `custom/<name>`;
      * the handler receives the client (as returned by {@link AuthProvider.getInfo}) and the stream, and must close it
      * (`closeOk()` / `closeErr()`). Streams of one name on one connection are handled one after another. A thrown error is
@@ -347,6 +359,8 @@ export default class Platform {
             trustProxy: config.trustProxy,
             maxConnectionsPerClient: config.maxConnectionsPerClient,
             maxPendingStreams: config.maxPendingStreams,
+            maxBufferedBytes: config.maxBufferedBytes,
+            allowUrlTokenWs: config.allowUrlTokenWs,
         });
         this.agentController = new AgentController(this.config.agentIndexPath, undefined, this.workerRequestTimeoutMs);
         this.serve();
