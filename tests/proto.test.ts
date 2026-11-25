@@ -55,9 +55,21 @@ describe('Proto Messages and Deserializer', () => {
             fragmentId: 'f-1',
             type: UpdateTypes.Patch,
             data: { v: 99 },
+            seq: 3,
         });
         const updateDeser = deserialize(JSON.parse(JSON.stringify(update)));
         assert.ok(updateDeser instanceof SendUpdate);
         assert.strictEqual((updateDeser as SendUpdate).data.type, UpdateTypes.Patch);
+        assert.strictEqual((updateDeser as SendUpdate).data.seq, 3);
+
+        const legacyUpdate = new SendUpdate({
+            activityId: 'act-1',
+            fragmentId: 'f-1',
+            type: UpdateTypes.Full,
+            data: { v: 1 },
+        });
+        const legacyDeser = deserialize(JSON.parse(JSON.stringify(legacyUpdate)));
+        assert.ok(legacyDeser instanceof SendUpdate);
+        assert.strictEqual((legacyDeser as SendUpdate).data.seq, undefined);
     });
 });

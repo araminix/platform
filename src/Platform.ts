@@ -10,6 +10,8 @@ import Endpoint, { EndpointOptions, MinioOptions, RateLimitConfig, UploadAllowli
 
 /** Default of {@link PlatformConfig.workerRequestTimeoutMs}: 5 minutes. */
 const DEFAULT_WORKER_REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
+/** Default of {@link PlatformConfig.outgoingStreamTimeoutMs}: 10 seconds. */
+const DEFAULT_OUTGOING_STREAM_TIMEOUT_MS = 10_000;
 /** Default of {@link PlatformConfig.instanceIdleTimeoutMs}: 15 minutes. */
 const DEFAULT_INSTANCE_IDLE_TIMEOUT_MS = 15 * 60 * 1000;
 /** How often idle instances are looked for. */
@@ -105,6 +107,14 @@ export interface PlatformConfig {
      * @defaultValue `300000` (5 minutes)
      */
     workerRequestTimeoutMs?: number;
+    /**
+     * How long an app instance waits for a client to accept and close an outgoing stream (`activityList`, `build`, `push`,
+     * `update-<fragmentId>`), in milliseconds. On timeout the stream is closed with an error and the worker request is
+     * rejected so a stalled client cannot block the worker IPC channel. `0` waits forever.
+     *
+     * @defaultValue `10000` (10 seconds)
+     */
+    outgoingStreamTimeoutMs?: number;
     /**
      * See {@link EndpointOptions.port}.
      *
@@ -340,6 +350,11 @@ export default class Platform {
     /** Effective {@link PlatformConfig.workerRequestTimeoutMs}. */
     private get workerRequestTimeoutMs(): number {
         return this.config.workerRequestTimeoutMs ?? DEFAULT_WORKER_REQUEST_TIMEOUT_MS;
+    }
+
+    /** Effective {@link PlatformConfig.outgoingStreamTimeoutMs}. */
+    private get outgoingStreamTimeoutMs(): number {
+        return this.config.outgoingStreamTimeoutMs ?? DEFAULT_OUTGOING_STREAM_TIMEOUT_MS;
     }
 
     /** Number of running app instances across all clients. */
@@ -794,6 +809,7 @@ export default class Platform {
                         this.config.resourceLimits,
                         undefined,
                         this.workerRequestTimeoutMs,
+                        this.outgoingStreamTimeoutMs,
                     );
                     createdInstance = instance;
                     instances.set(instance.id, instance);

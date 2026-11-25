@@ -379,7 +379,7 @@ export enum UpdateTypes {
 
 /**
  * Sends data to a fragment's client component; created by {@link Fragment.$update} and {@link Fragment.$patch}. The
- * client receives `{ data, type }` on the stream `update-<fragmentId>`. Sent only while the activity is active.
+ * client receives `{ data, type, seq }` on the stream `update-<fragmentId>`. Sent only while the activity is active.
  *
  * @typeParam D - Data type.
  */

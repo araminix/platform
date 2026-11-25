@@ -148,7 +148,7 @@ export class SendPush<TData = unknown> extends Req {
 }
 
 /**
- * Payload of {@link SendUpdate}; the client receives `{ data, type }` on the stream `update-<fragmentId>`.
+ * Payload of {@link SendUpdate}; the client receives `{ data, type, seq }` on the stream `update-<fragmentId>`.
  *
  * @typeParam TData - Data type.
  */
@@ -161,6 +161,8 @@ export interface Update<TData = unknown> {
     type: UpdateTypes;
     /** The data. */
     data: TData;
+    /** Per-fragment monotonic sequence number (starting at 1) for ordering and gap detection. */
+    seq?: number;
 }
 
 /**

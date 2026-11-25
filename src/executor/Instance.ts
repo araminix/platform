@@ -1,4 +1,4 @@
-import { deal, Err, err, logger, Ok, ok, once, R, Result, Socket, StreamCloseCodes, t, uuid } from '@araminix/lib';
+import { deal, Err, err, logger, Ok, ok, once, R, Result, Socket, Stream, StreamCloseCodes, t, uuid } from '@araminix/lib';
 import { MessageChannel, ResourceLimits, Worker } from 'worker_threads';
 
 import AgentController from '../agent/AgentController.js';
@@ -23,6 +23,9 @@ import {
     UpdateActivityList,
     WorkerInit,
 } from './proto.js';
+
+/** Default timeout for outgoing client streams in milliseconds (10 seconds). */
+const DEFAULT_OUTGOING_STREAM_TIMEOUT_MS = 10_000;
 
 /** Lifecycle of an {@link Instance}. */
 enum Status {
@@ -73,6 +76,8 @@ export default class Instance {
     readonly terminationGracePeriodMs: number;
     /** Timeout of requests to the worker in milliseconds (0 = none). */
     readonly requestTimeoutMs: number;
+    /** Timeout of outgoing client streams in milliseconds (0 = none). */
+    readonly outgoingStreamTimeoutMs: number;
     /** The app worker thread. */
     private worker?: Worker = undefined;
     /** Requests to the worker. */
@@ -109,6 +114,7 @@ export default class Instance {
      * @param terminationGracePeriodMs - Grace period before the worker is terminated on destroy (default 500 ms).
      * @param requestTimeoutMs - Timeout of requests to the worker (default 0 = none; Platform passes
      *     `workerRequestTimeoutMs`).
+     * @param outgoingStreamTimeoutMs - Timeout of outgoing client streams in milliseconds (default 10000; 0 = none).
      */
     constructor(
         userId: string,
@@ -120,6 +126,7 @@ export default class Instance {
         resourceLimits?: ResourceLimits,
         terminationGracePeriodMs: number = 500,
         requestTimeoutMs: number = 0,
+        outgoingStreamTimeoutMs: number = DEFAULT_OUTGOING_STREAM_TIMEOUT_MS,
     ) {
         this.userId = userId;
         this.appName = appName;
@@ -130,6 +137,7 @@ export default class Instance {
         this.resourceLimits = resourceLimits;
         this.terminationGracePeriodMs = terminationGracePeriodMs;
         this.requestTimeoutMs = requestTimeoutMs;
+        this.outgoingStreamTimeoutMs = outgoingStreamTimeoutMs;
     }
 
     /** Whether {@link Instance.destroy} ran. */
@@ -479,25 +487,89 @@ export default class Instance {
 
     /**
      * Forwards a worker request to the client as an outgoing stream and answers the worker with `Res` when the client closed
-     * the stream normally, `Rej` otherwise (also when no client is connected).
+     * the stream normally, `Rej` otherwise (also when no client is connected or the stream times out).
      */
     private async outgoingStream(name: string, arg: unknown): Promise<void> {
-        if (!this.userSocket || !this.responseSocket) {
-            this.responseSocket?.write(new Rej());
+        const userSocket = this.userSocket;
+        const responseSocket = this.responseSocket;
+        if (!userSocket || !responseSocket) {
+            responseSocket?.write(new Rej());
             return;
         }
-        const streamResult = await this.userSocket.outgoingStream(name, arg);
-        if (streamResult.isErr()) {
-            this.responseSocket.write(new Rej());
-            return;
+
+        const timeoutMs = this.outgoingStreamTimeoutMs;
+        const TIMEOUT = Symbol('outgoingStreamTimeout');
+        let timedOut = false;
+        let activeStream: Stream | undefined;
+        let timer: ReturnType<typeof setTimeout> | undefined;
+
+        const timeoutPromise =
+            timeoutMs > 0
+                ? new Promise<typeof TIMEOUT>((resolve) => {
+                      timer = setTimeout(() => {
+                          timedOut = true;
+                          if (activeStream) {
+                              try {
+                                  activeStream.closeErr();
+                              } catch {}
+                          }
+                          resolve(TIMEOUT);
+                      }, timeoutMs);
+                  })
+                : undefined;
+
+        try {
+            const streamPromise = userSocket.outgoingStream(name, arg);
+            if (timeoutPromise) {
+                streamPromise
+                    .then((res) => {
+                        if (timedOut && res.isOk()) {
+                            try {
+                                res.unwrap().closeErr();
+                            } catch {}
+                        }
+                    })
+                    .catch(() => {});
+            }
+
+            const streamResult = timeoutPromise ? await Promise.race([streamPromise, timeoutPromise]) : await streamPromise;
+            if (timedOut || streamResult === TIMEOUT) {
+                logger.warn(`Outgoing stream '${name}' timed out after ${timeoutMs}ms while opening`);
+                responseSocket.write(new Rej());
+                return;
+            }
+            if (streamResult.isErr()) {
+                responseSocket.write(new Rej());
+                return;
+            }
+
+            const stream = streamResult.unwrap();
+            activeStream = stream;
+
+            const closeCode = timeoutPromise ? await Promise.race([stream.waitClose(), timeoutPromise]) : await stream.waitClose();
+            if (timedOut || closeCode === TIMEOUT) {
+                logger.warn(`Outgoing stream '${name}' timed out after ${timeoutMs}ms waiting for close`);
+                responseSocket.write(new Rej());
+                return;
+            }
+            if (closeCode !== StreamCloseCodes.Normal) {
+                responseSocket.write(new Rej());
+                return;
+            }
+            responseSocket.write(new Res());
+        } catch (error) {
+            logger.error(`Error in outgoing stream '${name}':`, error);
+            if (activeStream) {
+                try {
+                    activeStream.closeErr();
+                } catch {}
+            }
+            responseSocket.write(new Rej());
+        } finally {
+            if (timer !== undefined) {
+                clearTimeout(timer);
+            }
         }
-        const stream = streamResult.unwrap();
-        const closeCode = await stream.waitClose();
-        if (closeCode !== StreamCloseCodes.Normal) {
-            this.responseSocket.write(new Rej());
-            return;
-        }
-        this.responseSocket.write(new Res());
     }
 
     /** Serves the worker's requests one at a time (agent requests and client output) until the channel closes, then destroys the instance. */
@@ -556,10 +628,18 @@ export default class Instance {
                 }
                 case request instanceof SendUpdate: {
                     const sendUpdate = request as SendUpdate;
-                    await this.outgoingStream(`update-${sendUpdate.data.fragmentId}`, {
-                        data: sendUpdate.data.data,
-                        type: sendUpdate.data.type,
-                    });
+                    const payload =
+                        sendUpdate.data.seq !== undefined
+                            ? {
+                                  data: sendUpdate.data.data,
+                                  type: sendUpdate.data.type,
+                                  seq: sendUpdate.data.seq,
+                              }
+                            : {
+                                  data: sendUpdate.data.data,
+                                  type: sendUpdate.data.type,
+                              };
+                    await this.outgoingStream(`update-${sendUpdate.data.fragmentId}`, payload);
                     break;
                 }
             }

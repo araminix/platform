@@ -100,6 +100,8 @@ export class ActivityDriver {
     private activity: ActivityInstance;
     /** Activity id, used by the client to address the activity. */
     readonly id: string = uuid();
+    /** Per-fragment monotonic update sequence counters (starting at 1). */
+    private fragmentSeq: Map<string, number> = new Map();
 
     /**
      * @param appInstance - The app the activity belongs to.
@@ -348,21 +350,25 @@ export class ActivityDriver {
     }
 
     /**
-     * Sends a fragment update to the client (only while active).
+     * Sends a fragment update to the client (only while active) with a per-fragment monotonic sequence number (`seq`,
+     * starting at 1).
      *
      * @param fragmentId - Target fragment.
      * @param type - Full or patch.
      * @param data - The data.
      */
     async sendUpdate(fragmentId: string, type: UpdateTypes, data: any): Promise<AppResult> {
-        return this.request(
-            new SendUpdate({
-                activityId: this.id,
-                fragmentId,
-                type,
-                data,
-            }),
-        );
+        return this.executeIfActive(async () => {
+            const seq = (this.fragmentSeq.get(fragmentId) ?? 0) + 1;
+            this.fragmentSeq.set(fragmentId, seq);
+            const result = await workerDriver().request(
+                new SendUpdate({ activityId: this.id, fragmentId, type, data, seq }),
+            );
+            if (result.isErr()) {
+                return new Err(AppError.Other);
+            }
+            return ok();
+        });
     }
 
     /**
