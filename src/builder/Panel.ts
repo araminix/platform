@@ -18,7 +18,7 @@ export interface PanelSet {
     render: () => void | Promise<void>;
 }
 
-/** A layout container in the UI tree. Created by {@link panel}; serialised as `{ id, type: 'Panel', styles, content }`. */
+/** A layout container in the UI tree. Created by {@link panel}; serialized as `{ id, type: 'Panel', styles, content }`. */
 export class Panel implements Part {
     /** Random id. */
     private id: string = uuid();
@@ -42,7 +42,7 @@ export class Panel implements Part {
         this.parts.push(panel);
     }
 
-    /** Serialises the panel and its children. */
+    /** Serializes the panel and its children. */
     _build(): BuildedPart {
         return {
             id: this.id,

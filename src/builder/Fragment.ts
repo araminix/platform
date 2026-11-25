@@ -54,7 +54,7 @@ export class FragmentInterface implements Part {
         this.cleanUp = cleanUp;
     }
 
-    /** Serialises the fragment as `{ id, type, styles }`. */
+    /** Serializes the fragment as `{ id, type, styles }`. */
     _build(): BuildedPart {
         return {
             id: this.id,
@@ -177,7 +177,7 @@ export default abstract class Fragment<I extends { styles?: Array<string> | unde
     /**
      * Registers the handler of the client action `name` (replacing an earlier one). The client sends actions on the instance
      * socket's `action` stream as `{ fragmentId, name, data }`; the returned actor is applied to the activity, and the client
-     * receives the serialised `Ok`/`Err` result.
+     * receives the serialized `Ok`/`Err` result.
      *
      * @typeParam TActionData - Type of the action data. It is not validated: check it if the client is not trusted.
      * @param name - Action name.

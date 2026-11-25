@@ -400,7 +400,7 @@ The `build` stream carries the UI tree: a root `Panel` containing the `column` p
 ### Threads and isolation
 
 - **Main thread.** Only networking and routing: the [`Endpoint`](#endpoint), the accept loops of [`Platform`](#platform), one `Instance` per running app instance and one `AgentInstance` per connected agent. It also holds one [`AppIndex`](#appindex) to answer app listings. No page or fragment code runs here.
-- **App worker threads.** `createInstance` starts a worker that imports `appIndexPath` itself, finds the app by name and runs it. All activities of that instance live in the worker. Requests from the client (`load`, `action`, `query`, ...) and [`trigger()`](#activity) calls from timers are serialised by a per-instance lock. Workers get `resourceLimits` (default 128 MB old generation, 4 MB stack); when an instance is destroyed its worker has 500 ms to exit before it is terminated.
+- **App worker threads.** `createInstance` starts a worker that imports `appIndexPath` itself, finds the app by name and runs it. All activities of that instance live in the worker. Requests from the client (`load`, `action`, `query`, ...) and [`trigger()`](#activity) calls from timers are serialized by a per-instance lock. Workers get `resourceLimits` (default 128 MB old generation, 4 MB stack); when an instance is destroyed its worker has 500 ms to exit before it is terminated.
 - **Agent worker threads.** Each connected agent id gets a worker that imports `agentIndexPath` and creates the [`Agent`](#agent) of the requested type. It has 5 seconds to start; otherwise the connection is denied.
 - **Messages between threads** are structured-clone copies of protocol classes ([`Req`](#req), [`Res`](#res), [`Rej`](#rej)) with request ids. The main thread waits at most `workerRequestTimeoutMs` (5 minutes) for a worker's answer and ignores late answers. Nothing is shared between threads: an app worker has its own copy of every module, including your own singletons.
 
@@ -434,8 +434,8 @@ Stream details:
 | `build` (server)                               | `{ isPop, hasPrev, activityId, build }`        | close it with `closeOk()`                                                                                                          |
 | `push` (server)                                | data passed to [`push()`](#activity)           | close it with `closeOk()`                                                                                                          |
 | `update-<fragmentId>` (server)                 | `{ data, type: 'Full' \| 'Patch' }`            | close it with `closeOk()`                                                                                                          |
-| `post` (agent)                                 | `{ name, data }`                               | the serialised `Result` returned by [`Agent.onPost`](#agent)                                                                       |
-| `<task>` (server to agent)                     | task data                                      | the agent writes a serialised `Result` (`{ ok: true, v }` or `{ ok: false, e }`)                                                   |
+| `post` (agent)                                 | `{ name, data }`                               | the serialized `Result` returned by [`Agent.onPost`](#agent)                                                                       |
+| `<task>` (server to agent)                     | task data                                      | the agent writes a serialized `Result` (`{ ok: true, v }` or `{ ok: false, e }`)                                                   |
 
 On the instance streams, `e` is `'Format'` when the arguments have the wrong shape and `'Execution'` when the worker rejected the request or did not answer in time.
 
@@ -782,7 +782,7 @@ const answer = await agent.post('status', { paper: 'low' });
 Behaviour worth knowing:
 
 - [`acquire(id)`](#agentfactory) succeeds only while an agent with that id and type is connected; [`list()`](#agentfactory) returns the connected ids of a type. Both work only inside worker threads.
-- A task waits up to 60 seconds for the agent's answer. The agent must answer with a serialised `Result` (`AgentClient.onTask` does that).
+- A task waits up to 60 seconds for the agent's answer. The agent must answer with a serialized `Result` (`AgentClient.onTask` does that).
 - While an agent is connected the platform sends it a `ping` task every 30 seconds; agents may ignore it.
 - The agent's worker survives reconnects; it is stopped when the agent closes its connection on purpose (`agent.destroy()`), when the worker fails or on [`Platform.stop()`](#platform). A reconnect with a different `agentType` for the same id replaces the worker.
 - A thrown error in `onPost` is answered with `Err(message)` and the worker keeps running.
@@ -2142,7 +2142,7 @@ declare class CommunicationAgentError {
 }
 ```
 
-The task got no usable answer: the agent is not connected, the stream failed, the 60-second timeout expired or the answer was not a serialised `Result`.
+The task got no usable answer: the agent is not connected, the stream failed, the 60-second timeout expired or the answer was not a serialized `Result`.
 
 ### Executor
 
@@ -2480,7 +2480,7 @@ No breaking changes. Behaviour you may notice:
 - **Node.js 22 or later** is required (`engines.node >= 22`), as for `@araminix/lib` 2.x, which uses the native `WebSocket`.
 - **How `@araminix/lib` is declared changed several times:** 2.0.0 declared it as a peer dependency (`^1.3.0 || ^2.0.0`); 2.1.2 to 2.2.1 listed it only as a development dependency, so applications had to install it themselves; since 2.3.0 it is a regular dependency again (3.1.0).
 - **`@araminix/lib` 3.x**: the platform's sources type-check against lib 3.1, and the platform only calls `unwrap()` after checking `isOk()`/`isErr()`. Lib 3 makes `Err.unwrap()` always throw an `Error`; review your own code if it relied on catching the raw error value.
-- Behaviour changes since 1.x that you may notice: WebSocket messages are capped at 16 MiB and sockets are pinged every 30 seconds (1.10); error objects are no longer echoed to clients, only string and number codes (1.10); `/2fa/enable` and `/2fa/disable` share the authentication rate limit (1.10); a client may hold at most 32 connections per endpoint (2.1.0); activity changes of an instance are serialised by a lock (2.1.1).
+- Behaviour changes since 1.x that you may notice: WebSocket messages are capped at 16 MiB and sockets are pinged every 30 seconds (1.10); error objects are no longer echoed to clients, only string and number codes (1.10); `/2fa/enable` and `/2fa/disable` share the authentication rate limit (1.10); a client may hold at most 32 connections per endpoint (2.1.0); activity changes of an instance are serialized by a lock (2.1.1).
 
 ## Testing
 

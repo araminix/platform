@@ -49,7 +49,7 @@ export class AcquireAgent extends Req {
 }
 
 /**
- * Worker to main: send task `name` with `data` to agent `id`; resolved with {@link Data} holding the agent's serialised
+ * Worker to main: send task `name` with `data` to agent `id`; resolved with {@link Data} holding the agent's serialized
  * `Result`.
  *
  * @typeParam TData - Task data type.
@@ -81,7 +81,7 @@ export class AgentTask<TData = unknown> extends Req {
 }
 
 /**
- * Main to agent worker: a message posted by the agent process; resolved with {@link Data} holding the serialised result
+ * Main to agent worker: a message posted by the agent process; resolved with {@link Data} holding the serialized result
  * of `Agent.onPost`.
  *
  * @typeParam TData - Posted data type.

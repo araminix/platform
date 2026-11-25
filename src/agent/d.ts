@@ -37,7 +37,7 @@ export class ExecutionAgentError<E = unknown> extends AgentError {
 
 /**
  * The task got no usable answer: the agent is not connected, the task stream could not be opened, no reply arrived within
- * 60 seconds, or the reply was not a serialised `Result`.
+ * 60 seconds, or the reply was not a serialized `Result`.
  */
 export class CommunicationAgentError extends AgentError {
     /** Always {@link AgentErrorType.Communication}. */
@@ -102,7 +102,7 @@ export abstract class Agent<INDEX extends AgentIndex = AgentIndex> {
      * Sends a task to the agent process and waits for its answer.
      *
      * The platform opens a stream named `name` with `data` as its arguments on the agent's connection; the agent process
-     * answers with a serialised `Result` (`AgentClient.onTask` in `@araminix/lib` does this). Tasks of one thread are sent one
+     * answers with a serialized `Result` (`AgentClient.onTask` in `@araminix/lib` does this). Tasks of one thread are sent one
      * at a time. Works only inside app and agent worker threads.
      *
      * @typeParam TData - Type of the task data (cloneable and JSON-serialisable).
@@ -127,7 +127,7 @@ export abstract class Agent<INDEX extends AgentIndex = AgentIndex> {
 
     /**
      * Handles a message posted by the agent process (`AgentClient.post(name, data)` on its side). Runs in the agent's worker
-     * thread; the returned `Result` is serialised and sent back as the answer. A thrown error is answered with
+     * thread; the returned `Result` is serialized and sent back as the answer. A thrown error is answered with
      * `Err(error.message)` and the worker keeps running.
      *
      * @typeParam TData - Type of the posted data (not validated).

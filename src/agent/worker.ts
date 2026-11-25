@@ -36,7 +36,7 @@ class AgentWorker {
     }
 
     /**
-     * Answers `AgentPost` requests with the serialised result of {@link Agent.onPost} (a thrown error becomes
+     * Answers `AgentPost` requests with the serialized result of {@link Agent.onPost} (a thrown error becomes
      * `Err(message)`) until the port closes, then closes the request socket.
      */
     async run(): Promise<void> {

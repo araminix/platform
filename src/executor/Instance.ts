@@ -1,8 +1,9 @@
-import { deal, Err, err, logger, Ok, ok, once, R, Result, Socket, Stream, StreamCloseCodes, t, uuid } from '@araminix/lib';
+import { deal, Err, err, logger, Ok, ok, once, R, Result, Socket, t, uuid } from '@araminix/lib';
 import { MessageChannel, ResourceLimits, Worker } from 'worker_threads';
 
 import AgentController from '../agent/AgentController.js';
-import { Rej, RequestSocket, Res, ResponseSocket } from '../lib/worker_socket.js';
+import { Req, RequestSocket, ResponseSocket } from '../lib/worker_socket.js';
+import { sendOutgoingStream } from './outgoingStream.js';
 import {
     AcquireAgent,
     Action,
@@ -39,13 +40,19 @@ enum Status {
     Destroyed = 3,
 }
 
-/** Error codes the client receives (serialised as `{ ok: false, e }`) on the instance streams. */
+/** Error codes the client receives (serialized as `{ ok: false, e }`) on the instance streams. */
 enum IncomingStreamErr {
     /** The stream arguments have the wrong shape. */
     Format = 'Format',
     /** The worker is not ready, rejected the request or did not answer in time. */
     Execution = 'Execution',
 }
+
+const FRAGMENT_CALL_ARGS = t.type({
+    fragmentId: t.string,
+    name: t.string,
+    data: t.unknown,
+});
 
 /**
  * One running app instance, seen from the main thread: an app worker thread, the two IPC channels to it, and the user's
@@ -103,19 +110,6 @@ export default class Instance {
     /** Pending forced termination of the worker. */
     private terminationTimer?: NodeJS.Timeout = undefined;
 
-    /**
-     * @param userId - Owner of the instance.
-     * @param appName - App to run.
-     * @param profile - Launch profile, or `null`.
-     * @param appIndexPath - URL of the app index module.
-     * @param tabLimit - Activity limit.
-     * @param agentController - Agent router.
-     * @param resourceLimits - Worker resource limits (default 128 MB old generation, 4 MB stack).
-     * @param terminationGracePeriodMs - Grace period before the worker is terminated on destroy (default 500 ms).
-     * @param requestTimeoutMs - Timeout of requests to the worker (default 0 = none; Platform passes
-     *     `workerRequestTimeoutMs`).
-     * @param outgoingStreamTimeoutMs - Timeout of outgoing client streams in milliseconds (default 10000; 0 = none).
-     */
     constructor(
         userId: string,
         appName: string,
@@ -181,30 +175,21 @@ export default class Instance {
         this.userSocket = socket;
         this.disconnectedSince = undefined;
         once(async () => {
-            this.processStream(socket, 'load', () => this.load()).catch((err) => {
-                logger.error('Unhandled error in processStream load:', err);
-            });
-            this.processStream(socket, 'reload', (args) => this.reload(args)).catch((err) => {
-                logger.error('Unhandled error in processStream reload:', err);
-            });
-            this.processStream(socket, 'prev', (args) => this.prev(args)).catch((err) => {
-                logger.error('Unhandled error in processStream prev:', err);
-            });
-            this.processStream(socket, 'close', (args) => this.close(args)).catch((err) => {
-                logger.error('Unhandled error in processStream close:', err);
-            });
-            this.processStream(socket, 'switch', (args) => this.switchActive(args)).catch((err) => {
-                logger.error('Unhandled error in processStream switch:', err);
-            });
-            this.processStream(socket, 'action', (args) => this.action(args)).catch((err) => {
-                logger.error('Unhandled error in processStream action:', err);
-            });
-            this.processStream(socket, 'query', (args) => this.query(args)).catch((err) => {
-                logger.error('Unhandled error in processStream query:', err);
-            });
-            this.processStream(socket, 'refresh', (args) => this.refresh(args)).catch((err) => {
-                logger.error('Unhandled error in processStream refresh:', err);
-            });
+            const streams: Array<[string, (args: unknown) => Promise<Result<unknown, IncomingStreamErr>>]> = [
+                ['load', () => this.sendWorkerRequest(new Load())],
+                ['reload', (args) => this.sendStringArgRequest(args, (id) => new Reload(id))],
+                ['prev', (args) => this.sendStringArgRequest(args, (id) => new Prev(id))],
+                ['close', (args) => this.sendStringArgRequest(args, (id) => new Close(id))],
+                ['switch', (args) => this.sendStringArgRequest(args, (id) => new Switch(id))],
+                ['action', (args) => this.action(args)],
+                ['query', (args) => this.query(args)],
+                ['refresh', (args) => this.sendStringArgRequest(args, (id) => new Refresh(id))],
+            ];
+            for (const [streamName, handler] of streams) {
+                this.processStream(socket, streamName, handler).catch((err) => {
+                    logger.error(`Unhandled error in processStream ${streamName}:`, err);
+                });
+            }
             await socket.waitClose();
             if (this.userSocket === socket) {
                 this.userSocket = undefined;
@@ -213,121 +198,35 @@ export default class Instance {
         });
     }
 
-    /** `load` stream: asks the worker to send the active activity's build. */
-    private async load(): Promise<Result<void, IncomingStreamErr>> {
+    private async sendWorkerRequest(req: Req): Promise<Result<void, IncomingStreamErr>> {
         if (!this.requestSocket) {
             return new Err(IncomingStreamErr.Execution);
         }
-        const result = await this.requestSocket.writeRead(new Load());
+        const result = await this.requestSocket.writeRead(req);
         if (result.isErr()) {
             return new Err(IncomingStreamErr.Execution);
         }
         return ok();
     }
 
-    /** `reload` stream (args: activity id): re-render the active activity. */
-    private async reload(args: unknown): Promise<Result<void, IncomingStreamErr>> {
+    private async sendStringArgRequest(args: unknown, buildReq: (activityId: string) => Req): Promise<Result<void, IncomingStreamErr>> {
         if (typeof args !== 'string') {
             return new Err(IncomingStreamErr.Format);
         }
-        if (!this.requestSocket) {
-            return new Err(IncomingStreamErr.Execution);
-        }
-        const result = await this.requestSocket.writeRead(new Reload(args));
-        if (result.isErr()) {
-            return new Err(IncomingStreamErr.Execution);
-        }
-        return ok();
-    }
-
-    /** `prev` stream (args: activity id): go back. */
-    private async prev(args: unknown): Promise<Result<void, IncomingStreamErr>> {
-        if (typeof args !== 'string') {
-            return new Err(IncomingStreamErr.Format);
-        }
-        if (!this.requestSocket) {
-            return new Err(IncomingStreamErr.Execution);
-        }
-        const result = await this.requestSocket.writeRead(new Prev(args));
-        if (result.isErr()) {
-            return new Err(IncomingStreamErr.Execution);
-        }
-        return ok();
-    }
-
-    /** `close` stream (args: activity id): the user closes an activity. */
-    private async close(args: unknown): Promise<Result<void, IncomingStreamErr>> {
-        if (typeof args !== 'string') {
-            return new Err(IncomingStreamErr.Format);
-        }
-        if (!this.requestSocket) {
-            return new Err(IncomingStreamErr.Execution);
-        }
-        const result = await this.requestSocket.writeRead(new Close(args));
-        if (result.isErr()) {
-            return new Err(IncomingStreamErr.Execution);
-        }
-        return ok();
-    }
-
-    /** `switch` stream (args: activity id): activate another activity. */
-    private async switchActive(args: unknown): Promise<Result<void, IncomingStreamErr>> {
-        if (typeof args !== 'string') {
-            return new Err(IncomingStreamErr.Format);
-        }
-        if (!this.requestSocket) {
-            return new Err(IncomingStreamErr.Execution);
-        }
-        const result = await this.requestSocket.writeRead(new Switch(args));
-        if (result.isErr()) {
-            return new Err(IncomingStreamErr.Execution);
-        }
-        return ok();
-    }
-
-    /** `refresh` stream (args: activity id): rebuild an activity with its context. */
-    private async refresh(args: unknown): Promise<Result<void, IncomingStreamErr>> {
-        if (typeof args !== 'string') {
-            return new Err(IncomingStreamErr.Format);
-        }
-        if (!this.requestSocket) {
-            return new Err(IncomingStreamErr.Execution);
-        }
-        const result = await this.requestSocket.writeRead(new Refresh(args));
-        if (result.isErr()) {
-            return new Err(IncomingStreamErr.Execution);
-        }
-        return ok();
+        return this.sendWorkerRequest(buildReq(args));
     }
 
     /** `action` stream (args: `{ fragmentId, name, data }`): run a fragment action. */
     private async action(args: unknown): Promise<Result<void, IncomingStreamErr>> {
-        const argsType = t.type({
-            fragmentId: t.string,
-            name: t.string,
-            data: t.unknown,
-        });
-        if (!argsType.is(args)) {
+        if (!FRAGMENT_CALL_ARGS.is(args)) {
             return new Err(IncomingStreamErr.Format);
         }
-        if (!this.requestSocket) {
-            return new Err(IncomingStreamErr.Execution);
-        }
-        const result = await this.requestSocket.writeRead(new Action(args.fragmentId, args.name, args.data));
-        if (result.isErr()) {
-            return new Err(IncomingStreamErr.Execution);
-        }
-        return ok();
+        return this.sendWorkerRequest(new Action(args.fragmentId, args.name, args.data));
     }
 
     /** `query` stream (args: `{ fragmentId, name, data }`): run a fragment query and return its answer. */
     private async query(args: unknown): Promise<Result<unknown, IncomingStreamErr>> {
-        const argsType = t.type({
-            fragmentId: t.string,
-            name: t.string,
-            data: t.unknown,
-        });
-        if (!argsType.is(args)) {
+        if (!FRAGMENT_CALL_ARGS.is(args)) {
             return new Err(IncomingStreamErr.Format);
         }
         if (!this.requestSocket) {
@@ -341,7 +240,7 @@ export default class Instance {
     }
 
     /**
-     * Serves one request stream name: for every incoming stream it runs `handler(args)`, writes the serialised result and
+     * Serves one request stream name: for every incoming stream it runs `handler(args)`, writes the serialized result and
      * closes the stream, until the socket closes.
      */
     private async processStream(socket: Socket, streamName: string, handler: (args: unknown) => Promise<Result<unknown, unknown>>): Promise<void> {
@@ -485,91 +384,8 @@ export default class Instance {
         }
     }
 
-    /**
-     * Forwards a worker request to the client as an outgoing stream and answers the worker with `Res` when the client closed
-     * the stream normally, `Rej` otherwise (also when no client is connected or the stream times out).
-     */
     private async outgoingStream(name: string, arg: unknown): Promise<void> {
-        const userSocket = this.userSocket;
-        const responseSocket = this.responseSocket;
-        if (!userSocket || !responseSocket) {
-            responseSocket?.write(new Rej());
-            return;
-        }
-
-        const timeoutMs = this.outgoingStreamTimeoutMs;
-        const TIMEOUT = Symbol('outgoingStreamTimeout');
-        let timedOut = false;
-        let activeStream: Stream | undefined;
-        let timer: ReturnType<typeof setTimeout> | undefined;
-
-        const timeoutPromise =
-            timeoutMs > 0
-                ? new Promise<typeof TIMEOUT>((resolve) => {
-                      timer = setTimeout(() => {
-                          timedOut = true;
-                          if (activeStream) {
-                              try {
-                                  activeStream.closeErr();
-                              } catch {}
-                          }
-                          resolve(TIMEOUT);
-                      }, timeoutMs);
-                  })
-                : undefined;
-
-        try {
-            const streamPromise = userSocket.outgoingStream(name, arg);
-            if (timeoutPromise) {
-                streamPromise
-                    .then((res) => {
-                        if (timedOut && res.isOk()) {
-                            try {
-                                res.unwrap().closeErr();
-                            } catch {}
-                        }
-                    })
-                    .catch(() => {});
-            }
-
-            const streamResult = timeoutPromise ? await Promise.race([streamPromise, timeoutPromise]) : await streamPromise;
-            if (timedOut || streamResult === TIMEOUT) {
-                logger.warn(`Outgoing stream '${name}' timed out after ${timeoutMs}ms while opening`);
-                responseSocket.write(new Rej());
-                return;
-            }
-            if (streamResult.isErr()) {
-                responseSocket.write(new Rej());
-                return;
-            }
-
-            const stream = streamResult.unwrap();
-            activeStream = stream;
-
-            const closeCode = timeoutPromise ? await Promise.race([stream.waitClose(), timeoutPromise]) : await stream.waitClose();
-            if (timedOut || closeCode === TIMEOUT) {
-                logger.warn(`Outgoing stream '${name}' timed out after ${timeoutMs}ms waiting for close`);
-                responseSocket.write(new Rej());
-                return;
-            }
-            if (closeCode !== StreamCloseCodes.Normal) {
-                responseSocket.write(new Rej());
-                return;
-            }
-            responseSocket.write(new Res());
-        } catch (error) {
-            logger.error(`Error in outgoing stream '${name}':`, error);
-            if (activeStream) {
-                try {
-                    activeStream.closeErr();
-                } catch {}
-            }
-            responseSocket.write(new Rej());
-        } finally {
-            if (timer !== undefined) {
-                clearTimeout(timer);
-            }
-        }
+        await sendOutgoingStream(this.userSocket, this.responseSocket, name, arg, this.outgoingStreamTimeoutMs);
     }
 
     /** Serves the worker's requests one at a time (agent requests and client output) until the channel closes, then destroys the instance. */

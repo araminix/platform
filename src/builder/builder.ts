@@ -23,7 +23,7 @@ export type Response<D = unknown, R = unknown> = (data: D) => Promise<R> | R;
 
 /** A node of the UI tree: a {@link Panel} or a fragment. */
 export interface Part {
-    /** Serialises the node for the client. */
+    /** Serializes the node for the client. */
     _build(): BuildedPart;
 }
 

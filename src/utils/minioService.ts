@@ -156,7 +156,7 @@ export class MinioService {
     private client!: Minio.Client;
     /** Connection settings. */
     private readonly minioClient: MinioClient;
-    /** Bucket name and presign expiry (seconds). */
+    /** Bucket name and pre-sign expiry (seconds). */
     private readonly additionalParams: { bucketName: string; expiry: number };
     /** Whether the client and bucket are ready. */
     private isInitialized = false;
@@ -193,7 +193,7 @@ export class MinioService {
     /** Creates the client and makes sure the bucket exists (once; concurrent callers share the attempt). */
     private async init(): Promise<void> {
         if (this.isInitialized) return;
-        // Concurrent first calls share one initialisation instead of racing makeBucket.
+        // Concurrent first calls share one initialization instead of racing makeBucket.
         if (!this.initPromise) {
             this.initPromise = (async () => {
                 this.client = new Minio.Client(this.minioClient);

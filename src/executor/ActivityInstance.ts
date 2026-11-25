@@ -25,109 +25,11 @@ import {
     WizardPop,
 } from '../lib/actors.js';
 import type { Activity } from '../lib/d.js';
-import { ActivityDriver as ActivityAppDriver, AppError, AppResult } from './AppInstance.js';
+import type { ActivityDriver as ActivityAppDriver } from './ActivityDriver.js';
+import { ActivityDriver, ActivityInterface, ActivityStatus, WizardHandler } from './activityRuntime.js';
+import { AppError, AppResult } from './types.js';
 
-/** The lifecycle hooks of one activity object, as returned by `Activity._init`; called by {@link ActivityInstance}. */
-export class ActivityInterface {
-    /** The activity object (a fresh instance of the template). */
-    readonly activity: Activity<any>;
-    /** Calls `beforeRender()`. */
-    readonly beforeRender: () => Promise<Actor> | Actor;
-    /** Calls `afterWake()` and stores its cleanup. */
-    readonly afterWake: () => void;
-    /** Runs the stored `afterWake()` cleanup. */
-    readonly cleanUp: () => void;
-    /** Calls `render()`. */
-    readonly render: () => Promise<void>;
-    /** Calls `title(ctx)`. */
-    readonly title: () => Promise<string> | string;
-    /** Replaces the activity object's context. */
-    readonly updateCtx: (ctx: any) => void;
-
-    /**
-     * @param activity - The activity object.
-     * @param beforeRender - `beforeRender` hook.
-     * @param afterWake - `afterWake` hook.
-     * @param cleanUp - Cleanup hook.
-     * @param render - `render` hook.
-     * @param title - `title` hook.
-     * @param updateCtx - Context setter.
-     */
-    constructor(
-        activity: Activity<any>,
-        beforeRender: () => Promise<Actor> | Actor,
-        afterWake: () => void,
-        cleanUp: () => void,
-        render: () => Promise<void>,
-        title: () => Promise<string> | string,
-        updateCtx: (ctx: any) => void,
-    ) {
-        this.activity = activity;
-        this.beforeRender = beforeRender;
-        this.afterWake = afterWake;
-        this.cleanUp = cleanUp;
-        this.render = render;
-        this.title = title;
-        this.updateCtx = updateCtx;
-    }
-}
-
-/** What activities and fragments use at runtime: `push`, `trigger` and the activity status. */
-export class ActivityDriver {
-    /** The activity. */
-    private activity: ActivityInstance;
-    /** The activity's driver on the app. */
-    private instanceDriver: ActivityAppDriver;
-
-    /**
-     * @param activity - The activity.
-     * @param instanceDriver - The activity's driver on the app.
-     */
-    constructor(activity: ActivityInstance, instanceDriver: ActivityAppDriver) {
-        this.activity = activity;
-        this.instanceDriver = instanceDriver;
-    }
-
-    /** Current lifecycle status of the activity. */
-    get status(): Status {
-        return this.activity.status;
-    }
-
-    /**
-     * Sends data on the `push` stream.
-     *
-     * @param data - The data.
-     */
-    async push<TData = unknown>(data: TData): Promise<AppResult> {
-        return await this.instanceDriver.sendPush(data);
-    }
-
-    /**
-     * Applies `actor` to the activity under the app lock.
-     *
-     * @param actor - The actor.
-     */
-    async trigger(actor: Actor): Promise<AppResult> {
-        return await this.instanceDriver.exclusive(() => this.activity.handleActor(actor));
-    }
-}
-
-/** Lifecycle status of an {@link ActivityInstance}. */
-enum Status {
-    /** Nothing prepared yet (or reset for a refresh). */
-    Initiated = 0,
-    /** Title and `beforeRender` done; not rendered (also the state of suspended activities). */
-    Prepared = 1,
-    /** Build created. */
-    Rendered = 2,
-    /** Build sent and `afterWake()` ran. */
-    Waked = 3,
-    /** Reserved. */
-    Done = 4,
-}
-
-/** The `on` callback of a wizard actor. */
-type WizardHandler = void | ((result: Result<any, any> | undefined) => Promise<any> | any);
+export { ActivityDriver, ActivityInterface };
 
 /**
  * Runtime state of one opened activity: its context, fragments, last build, lifecycle status and its links to other
@@ -153,7 +55,7 @@ export class ActivityInstance {
     /** Pop-up shown by this activity, if any. */
     popActivity: ActivityInstance | undefined = undefined;
     /** Lifecycle status. */
-    status: Status = Status.Initiated;
+    status: ActivityStatus = ActivityStatus.Initiated;
     /** Driver handed to the activity object and its fragments. */
     private activityDriver!: ActivityDriver;
     /** Title computed by the last prepare. */
@@ -199,10 +101,10 @@ export class ActivityInstance {
         }
     }
 
-    /** Resets to {@link Status.Initiated}, running cleanups, so the next load prepares again. */
+    /** Resets to {@link ActivityStatus.Initiated}, running cleanups, so the next load prepares again. */
     resetBeforeLoad(): void {
-        if (this.status > Status.Initiated) {
-            this.status = Status.Initiated;
+        if (this.status > ActivityStatus.Initiated) {
+            this.status = ActivityStatus.Initiated;
             this.cleanUpFragments();
             this.activityInterface.cleanUp();
         }
@@ -210,15 +112,15 @@ export class ActivityInstance {
 
     /** Prepares and renders if needed, sends the build, and wakes the activity unless it is already awake. */
     async load(): Promise<AppResult> {
-        const isWaked = this.status === Status.Waked;
-        if (this.status < Status.Rendered) {
-            if (this.status === Status.Initiated) {
+        const isWaked = this.status === ActivityStatus.Waked;
+        if (this.status < ActivityStatus.Rendered) {
+            if (this.status === ActivityStatus.Initiated) {
                 const prepareResult = await this.prepare();
                 if (prepareResult.isErr()) {
                     return prepareResult;
                 }
                 // beforeRender()'s actor may have rendered and sent this activity already ($refresh with a new context).
-                if (this.status >= Status.Rendered) {
+                if (this.status >= ActivityStatus.Rendered) {
                     return ok();
                 }
             } else {
@@ -228,7 +130,7 @@ export class ActivityInstance {
             const build = await builder.build(this.activityDriver, this.activityInterface.render);
             this.panel = build.mainPanel._build();
             this.fragments = build.fragments;
-            this.status = Status.Rendered;
+            this.status = ActivityStatus.Rendered;
         } else {
             // Built already: the client is loading it again (it reconnected or came back to this app), so it needs the tabs too.
             await this.driver.updateActivityList();
@@ -243,10 +145,10 @@ export class ActivityInstance {
         return ok();
     }
 
-    /** Resets to {@link Status.Prepared}, running cleanups, so the next load renders again. */
+    /** Resets to {@link ActivityStatus.Prepared}, running cleanups, so the next load renders again. */
     private resetBeforeReload(): void {
-        if (this.status > Status.Prepared) {
-            this.status = Status.Prepared;
+        if (this.status > ActivityStatus.Prepared) {
+            this.status = ActivityStatus.Prepared;
             this.cleanUpFragments();
             this.activityInterface.cleanUp();
         }
@@ -263,10 +165,10 @@ export class ActivityInstance {
         return await this.refresh(this.ctx);
     }
 
-    /** Resets to {@link Status.Initiated}, running cleanups. */
+    /** Resets to {@link ActivityStatus.Initiated}, running cleanups. */
     resetBeforeRefresh(): void {
-        if (this.status > Status.Initiated) {
-            this.status = Status.Initiated;
+        if (this.status > ActivityStatus.Initiated) {
+            this.status = ActivityStatus.Initiated;
             this.cleanUpFragments();
             this.activityInterface.cleanUp();
         }
@@ -292,11 +194,11 @@ export class ActivityInstance {
         return new Err(AppError.WrongAction);
     }
 
-    /** Runs all cleanups and drops to {@link Status.Prepared}; the next load renders again. */
+    /** Runs all cleanups and drops to {@link ActivityStatus.Prepared}; the next load renders again. */
     suspend(): void {
         this.cleanUpFragments();
         this.activityInterface.cleanUp();
-        this.status = Status.Prepared;
+        this.status = ActivityStatus.Prepared;
     }
 
     /**
@@ -347,10 +249,10 @@ export class ActivityInstance {
      * client and then woken by {@link ActivityInstance.load}.
      */
     async wake(): Promise<AppResult> {
-        if (this.status < Status.Rendered) {
+        if (this.status < ActivityStatus.Rendered) {
             return await this.load();
         }
-        this.status = Status.Waked;
+        this.status = ActivityStatus.Waked;
         // afterWake is where activities start timers; keep them out of the current lock context.
         this.driver.outsideLock(() => this.activityInterface.afterWake());
         if (this.popActivity) {
@@ -364,7 +266,7 @@ export class ActivityInstance {
         this.title = await this.activityInterface.title();
         await this.driver.updateActivityList();
         const action = await this.activityInterface.beforeRender();
-        this.status = Status.Prepared;
+        this.status = ActivityStatus.Prepared;
         if (!(action instanceof Nothing)) {
             return await this.handleActor(action);
         }
@@ -490,8 +392,8 @@ export class ActivityInstance {
      */
     setPop(activity?: ActivityInstance): void {
         this.popActivity = activity;
-        if (this.status === Status.Done) {
-            this.status = Status.Waked;
+        if (this.status === ActivityStatus.Done) {
+            this.status = ActivityStatus.Waked;
         }
     }
 
