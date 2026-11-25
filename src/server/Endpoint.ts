@@ -27,6 +27,17 @@ interface CustomRequest extends Request {
     file?: any;
 }
 
+/** Metadata recorded in `index.json` and returned by `POST /file`. */
+export interface UploadedFileInfo {
+    name: string;
+    size: number;
+    mimetype: string;
+    id: string;
+    userId: string;
+    unitId?: string | null;
+    [key: string]: unknown;
+}
+
 /**
  * Resolves a token to a user id. Not used by the platform itself; kept for compatibility with older integrations.
  */
@@ -231,6 +242,21 @@ export interface EndpointOptions {
      * @defaultValue unset (any file)
      */
     uploadAllowlist?: UploadAllowlist;
+    /**
+     * Optional hook invoked by `POST /file` before writing `index.json`. Returned key/value pairs are merged into the stored
+     * metadata (and HTTP response body), allowing applications to attach or override tenant/unit scope or visibility fields.
+     *
+     * @defaultValue unset (metadata records `name`, `size`, `mimetype`, `id`, `userId`, and `unitId` derived from `req.info.activeUnit`)
+     */
+    getUploadMetadata?: (req: Request & { token?: string; info?: ClientInfo }, fileInfo: UploadedFileInfo) => Record<string, unknown> | Promise<Record<string, unknown>>;
+    /**
+     * Optional authorization guard enforced on both `GET /file/:fileId` and static `GET /file/:fileId/:name` downloads.
+     * Receives the authenticated client (`info`), the parsed `index.json` metadata (`fileMeta`), and `fileId`. Returning
+     * `false` denies the request with HTTP 403; missing or corrupt metadata returns HTTP 404.
+     *
+     * @defaultValue unset (any authenticated user may download local uploads)
+     */
+    authorizeFileAccess?: (info: ClientInfo, fileMeta: Record<string, unknown>, fileId: string) => boolean | Promise<boolean>;
     /**
      * OAuth client ids whose Google access tokens `POST /gauth` accepts (matched against the token's `aud` or `azp`). When
      * unset or empty, `/gauth` answers HTTP 503.
@@ -466,6 +492,10 @@ export default class Endpoint {
     private maxUploadBytes: number;
     /** Upload restrictions. */
     private uploadAllowlist?: UploadAllowlist;
+    /** Optional hook to enrich or override `POST /file` metadata in `index.json`. */
+    private getUploadMetadata?: EndpointOptions['getUploadMetadata'];
+    /** Optional authorization callback enforced on local `/file` downloads. */
+    private authorizeFileAccess?: EndpointOptions['authorizeFileAccess'];
     /** Accepted Google OAuth client ids. */
     private googleClientIds?: string[];
     /** Browser origins allowed to open WebSockets. */
@@ -516,6 +546,8 @@ export default class Endpoint {
         cookieOptions,
         maxUploadBytes = 20 * 1024 * 1024,
         uploadAllowlist,
+        getUploadMetadata,
+        authorizeFileAccess,
         googleClientIds,
         allowedOrigins,
         authRateLimit,
@@ -543,6 +575,8 @@ export default class Endpoint {
         this.minio = minio;
         this.maxUploadBytes = maxUploadBytes;
         this.uploadAllowlist = uploadAllowlist;
+        this.getUploadMetadata = getUploadMetadata;
+        this.authorizeFileAccess = authorizeFileAccess;
         this.googleClientIds = googleClientIds;
         this.allowedOrigins = allowedOrigins;
         this.allowUrlTokenWs = allowUrlTokenWs;
@@ -1145,6 +1179,64 @@ export default class Endpoint {
         return unreserved.slice(0, 255);
     }
 
+    /** Extracts an optional active unit id from `info.activeUnit` (object with `_key` or plain string). */
+    private extractUnitId(info?: ClientInfo): string | null {
+        const activeUnit = (info as { activeUnit?: { _key?: string } | string } | undefined)?.activeUnit;
+        if (typeof activeUnit === 'string') {
+            return activeUnit || null;
+        }
+        if (activeUnit && typeof activeUnit === 'object' && typeof activeUnit._key === 'string') {
+            return activeUnit._key || null;
+        }
+        return null;
+    }
+
+    /** Reads and parses `<uploadDir>/<fileId>/index.json`, ensuring the resolved directory stays inside `uploadDir`. */
+    private async readFileMetadata(uploadDir: string, fileId: string): Promise<Record<string, unknown> | null> {
+        const resolvedUploadDir = path.resolve(uploadDir);
+        const uploadDirPrefix = resolvedUploadDir.endsWith(path.sep) ? resolvedUploadDir : `${resolvedUploadDir}${path.sep}`;
+        const resolvedFileDir = path.resolve(resolvedUploadDir, fileId);
+        if (!resolvedFileDir.startsWith(uploadDirPrefix)) {
+            return null;
+        }
+        try {
+            const raw = await fs.promises.readFile(path.join(resolvedFileDir, 'index.json'), 'utf8');
+            const parsed: unknown = JSON.parse(raw);
+            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+                return null;
+            }
+            return parsed as Record<string, unknown>;
+        } catch (err: any) {
+            if (err?.code !== 'ENOENT' && err?.code !== 'ENOTDIR') {
+                logger.error('Failed to read or parse index.json for fileId:', fileId, err);
+            }
+            return null;
+        }
+    }
+
+    /** Runs `authorizeFileAccess` when configured; sends 401/403/500 and returns `false` on denial or failure. */
+    private async checkFileAccess(req: CustomRequest, res: Response, fileMeta: Record<string, unknown>, fileId: string): Promise<boolean> {
+        if (!this.authorizeFileAccess) {
+            return true;
+        }
+        if (!req.info) {
+            res.status(401).send({ message: 'Unauthorized' }).end();
+            return false;
+        }
+        try {
+            const allowed = await this.authorizeFileAccess(req.info, fileMeta, fileId);
+            if (!allowed) {
+                res.status(403).json({ message: 'Forbidden' }).end();
+                return false;
+            }
+            return true;
+        } catch (err) {
+            logger.error('Error in authorizeFileAccess hook for fileId:', fileId, err);
+            res.status(500).json({ error: 'Internal server error' }).end();
+            return false;
+        }
+    }
+
     /**
      * Registers the local upload routes: `POST /file` (multipart field `file`), `GET /file/:fileId` (302 to the named URL)
      * and the static `GET /file/:fileId/:name` download, which is sent with `X-Content-Type-Options: nosniff`,
@@ -1156,9 +1248,15 @@ export default class Endpoint {
             destination: function (_req, file: any, cb) {
                 const id = uuid();
                 const dir = path.join(uploadDir, id);
-                fs.mkdirSync(dir, { recursive: true });
-                file.id = id;
-                cb(null, dir);
+                fs.promises
+                    .mkdir(dir, { recursive: true })
+                    .then(() => {
+                        file.id = id;
+                        cb(null, dir);
+                    })
+                    .catch((err) => {
+                        cb(err instanceof Error ? err : new Error(String(err)), '');
+                    });
             },
             filename: function (_req, file, cb) {
                 file.originalname = sanitize(file.originalname || '');
@@ -1230,70 +1328,127 @@ export default class Endpoint {
                     next();
                 });
             },
-            (req: CustomRequest, res) => {
+            async (req: CustomRequest, res: Response) => {
                 const { originalname, size, mimetype, id } = req.file;
-                const fileInfo = {
+                const baseFileInfo: UploadedFileInfo = {
                     name: originalname,
                     size,
                     mimetype,
                     id,
                     userId: req.info?.id ?? '',
+                    unitId: this.extractUnitId(req.info),
                 };
-                const infoPath = path.join(uploadDir, fileInfo.id, 'index.json');
-                fs.writeFile(infoPath, JSON.stringify(fileInfo), (err) => {
-                    if (err) {
-                        logger.error('Failed to write file metadata:', err);
+                let extraMetadata: Record<string, unknown> = {};
+                if (this.getUploadMetadata) {
+                    try {
+                        const customMeta = await this.getUploadMetadata(req, baseFileInfo);
+                        if (customMeta && typeof customMeta === 'object' && !Array.isArray(customMeta)) {
+                            extraMetadata = customMeta;
+                        }
+                    } catch (err) {
+                        logger.error('Failed to compute upload metadata:', err);
+                        await fs.promises.rm(path.join(uploadDir, id), { recursive: true, force: true }).catch(() => {});
                         res.status(500).json({ error: 'Failed to save file metadata' }).end();
                         return;
                     }
+                }
+                const fileInfo: UploadedFileInfo = {
+                    ...baseFileInfo,
+                    ...extraMetadata,
+                    id: baseFileInfo.id,
+                    name: baseFileInfo.name,
+                };
+                const infoPath = path.join(uploadDir, fileInfo.id, 'index.json');
+                try {
+                    await fs.promises.writeFile(infoPath, JSON.stringify(fileInfo));
                     res.status(200).json(fileInfo).end();
-                });
+                } catch (err) {
+                    logger.error('Failed to write file metadata:', err);
+                    res.status(500).json({ error: 'Failed to save file metadata' }).end();
+                }
             },
         );
 
-        this.express.get(`${this.mount}/file/:fileId`, validateToken, (req, res) => {
+        this.express.get(`${this.mount}/file/:fileId`, validateToken, async (req: CustomRequest, res: Response) => {
             const fileId = String(req.params.fileId);
             if (!UUID_PATTERN.test(fileId)) {
                 res.status(404).end();
                 return;
             }
-            const dir = path.join(uploadDir, fileId);
-            fs.readFile(path.join(dir, 'index.json'), (err, data) => {
-                if (err) {
-                    res.status(404).end();
-                } else {
-                    try {
-                        const info = JSON.parse(data.toString());
-                        if (!info || typeof info.name !== 'string') {
-                            res.status(404).end();
-                            return;
-                        }
-                        const safeName = encodeURIComponent(path.basename(info.name));
-                        if (!safeName) {
-                            res.status(404).end();
-                            return;
-                        }
-                        res.redirect(302, `${req.baseUrl}${req.path}/${safeName}`);
-                    } catch (parseErr) {
-                        logger.error('Corrupt index.json for fileId:', fileId, parseErr);
-                        res.status(404).end();
-                    }
-                }
-            });
+            const info = await this.readFileMetadata(uploadDir, fileId);
+            if (!info || typeof info.name !== 'string') {
+                res.status(404).end();
+                return;
+            }
+            if (!(await this.checkFileAccess(req, res, info, fileId))) {
+                return;
+            }
+            const safeName = encodeURIComponent(path.basename(info.name));
+            if (!safeName) {
+                res.status(404).end();
+                return;
+            }
+            res.redirect(302, `${req.baseUrl}${req.path}/${safeName}`);
         });
 
+        const resolvedUploadDir = path.resolve(uploadDir);
+        const uploadDirPrefix = resolvedUploadDir.endsWith(path.sep) ? resolvedUploadDir : `${resolvedUploadDir}${path.sep}`;
         this.express.use(
             `${this.mount}/file/`,
             validateToken,
-            (req: Request, res: Response, next: NextFunction) => {
-                // index.json holds upload metadata (including the uploader's user id); it is not a downloadable file.
-                if (path.basename(req.path) === 'index.json') {
+            async (req: CustomRequest, res: Response, next: NextFunction) => {
+                let decodedPath: string;
+                try {
+                    decodedPath = decodeURIComponent(req.path);
+                } catch {
                     res.status(404).end();
                     return;
                 }
+
+                // index.json holds upload metadata (including uploader/unit scope); it is not a downloadable file.
+                if (path.basename(req.path).toLowerCase() === 'index.json' || path.basename(decodedPath).toLowerCase() === 'index.json') {
+                    res.status(404).end();
+                    return;
+                }
+
+                if (decodedPath.includes('\0') || decodedPath.includes('\\')) {
+                    res.status(404).end();
+                    return;
+                }
+
+                const rawSegments = req.path.split('/').filter((segment) => segment.length > 0);
+                const decodedSegments = decodedPath.split('/').filter((segment) => segment.length > 0);
+                if (
+                    decodedSegments.length === 0 ||
+                    rawSegments.some((segment) => segment === '.' || segment === '..') ||
+                    decodedSegments.some((segment) => segment === '.' || segment === '..')
+                ) {
+                    res.status(404).end();
+                    return;
+                }
+
+                const fileId = decodedSegments[0];
+                const resolvedFileDir = path.resolve(resolvedUploadDir, fileId);
+                const resolvedTarget = path.resolve(resolvedUploadDir, ...decodedSegments);
+                if (!resolvedFileDir.startsWith(uploadDirPrefix) || !resolvedTarget.startsWith(`${resolvedFileDir}${path.sep}`)) {
+                    res.status(404).end();
+                    return;
+                }
+
+                if (this.authorizeFileAccess) {
+                    const fileMeta = await this.readFileMetadata(uploadDir, fileId);
+                    if (!fileMeta) {
+                        res.status(404).end();
+                        return;
+                    }
+                    if (!(await this.checkFileAccess(req, res, fileMeta, fileId))) {
+                        return;
+                    }
+                }
+
                 next();
             },
-            expressCore.static(this.uploadDir!, {
+            expressCore.static(uploadDir, {
                 index: false,
                 dotfiles: 'deny',
                 setHeaders: (res) => {

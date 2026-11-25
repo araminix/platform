@@ -157,6 +157,18 @@ export interface PlatformConfig {
      */
     uploadAllowlist?: UploadAllowlist;
     /**
+     * See {@link EndpointOptions.getUploadMetadata}.
+     *
+     * @defaultValue unset
+     */
+    getUploadMetadata?: EndpointOptions['getUploadMetadata'];
+    /**
+     * See {@link EndpointOptions.authorizeFileAccess}.
+     *
+     * @defaultValue unset
+     */
+    authorizeFileAccess?: EndpointOptions['authorizeFileAccess'];
+    /**
      * See {@link EndpointOptions.googleClientIds}.
      *
      * @defaultValue unset (`/gauth` answers 503)
@@ -358,6 +370,8 @@ export default class Platform {
             uploadDir: config.uploadDir,
             maxUploadBytes: config.maxUploadBytes,
             uploadAllowlist: config.uploadAllowlist,
+            getUploadMetadata: config.getUploadMetadata,
+            authorizeFileAccess: config.authorizeFileAccess,
             googleClientIds: config.googleClientIds,
             allowedOrigins: config.allowedOrigins,
             authRateLimit: config.authRateLimit,
