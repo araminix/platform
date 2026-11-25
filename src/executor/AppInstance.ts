@@ -173,6 +173,7 @@ export class AppInstance {
         await Promise.all(
             [...this.index].map(async (activity) => {
                 activity.suspend();
+                activity.suspendKeptSources();
             }),
         );
         this.index = [];
@@ -187,13 +188,15 @@ export class AppInstance {
 
     /**
      * Puts `activity` in the slot of activity `id` (or appends it when `id` is not open) and activates it; the previous
-     * activity is suspended if it was active.
+     * activity is suspended if it was active, unless `suspendCurrent` is `false`.
      *
      * @param id - Activity to replace.
      * @param activity - The replacement.
+     * @param suspendCurrent - Pass `false` when the caller kept the active activity built (see
+     * {@link ActivityInstance.keepUnderWizard}) instead of suspending it.
      */
-    async replace(id: string, activity: ActivityInstance): Promise<void> {
-        if (id === this.activeId) {
+    async replace(id: string, activity: ActivityInstance, suspendCurrent: boolean = true): Promise<void> {
+        if (suspendCurrent && id === this.activeId) {
             this.active.suspend();
         }
         const idx = this.index.findIndex((act) => act.driver.id === id);
@@ -226,6 +229,7 @@ export class AppInstance {
                 const idx = this.index.findIndex((act) => act === toClose);
                 this.index.splice(idx, 1);
                 this.historyRemove(toClose);
+                toClose.suspendKeptSources();
             }
         }
         this.activate(activity);
@@ -291,6 +295,7 @@ export class AppInstance {
             const isActive = this.active === activity;
             if (activity.driver.id === id) {
                 activity.suspend();
+                activity.suspendKeptSources();
                 this.index.splice(i, 1);
                 this.historyRemove(activity);
                 if (this.empty) {

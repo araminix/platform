@@ -62,6 +62,10 @@ export class ActivityInstance {
     title: string = '';
     /** Whether the activity is shown as a pop-up. */
     isPop: boolean = false;
+    /** Whether this stage is kept built while a wizard it popped is shown in its place (see {@link ActivityInstance.keepUnderWizard}). */
+    private keptUnderWizard: boolean = false;
+    /** Whether the current build still has to be sent to the client: set while the activity is kept under a wizard. */
+    private buildUnsent: boolean = false;
 
     /**
      * @param activityTemplate - The declared page or stage.
@@ -103,6 +107,8 @@ export class ActivityInstance {
 
     /** Resets to {@link ActivityStatus.Initiated}, running cleanups, so the next load prepares again. */
     resetBeforeLoad(): void {
+        this.keptUnderWizard = false;
+        this.buildUnsent = false;
         if (this.status > ActivityStatus.Initiated) {
             this.status = ActivityStatus.Initiated;
             this.cleanUpFragments();
@@ -139,6 +145,8 @@ export class ActivityInstance {
         if (result.isErr()) {
             return result;
         }
+        this.keptUnderWizard = false;
+        this.buildUnsent = false;
         if (!isWaked) {
             await this.wake();
         }
@@ -147,6 +155,8 @@ export class ActivityInstance {
 
     /** Resets to {@link ActivityStatus.Prepared}, running cleanups, so the next load renders again. */
     private resetBeforeReload(): void {
+        this.keptUnderWizard = false;
+        this.buildUnsent = false;
         if (this.status > ActivityStatus.Prepared) {
             this.status = ActivityStatus.Prepared;
             this.cleanUpFragments();
@@ -196,9 +206,41 @@ export class ActivityInstance {
 
     /** Runs all cleanups and drops to {@link ActivityStatus.Prepared}; the next load renders again. */
     suspend(): void {
+        this.keptUnderWizard = false;
+        this.buildUnsent = false;
         this.cleanUpFragments();
         this.activityInterface.cleanUp();
         this.status = ActivityStatus.Prepared;
+    }
+
+    /**
+     * Keeps this activity built while a wizard it popped takes its place: unlike {@link ActivityInstance.suspend}, the
+     * fragments and their state stay (a form keeps what the user typed, and a field can take the wizard's result), so when
+     * the wizard finishes the same build is sent again instead of rendering from scratch. Only `afterWake()`'s cleanup runs.
+     *
+     * @returns `false` when there is no build to keep; the caller suspends the activity as usual.
+     */
+    keepUnderWizard(): boolean {
+        if (this.status < ActivityStatus.Rendered) {
+            return false;
+        }
+        this.activityInterface.cleanUp();
+        this.status = ActivityStatus.Rendered;
+        this.keptUnderWizard = true;
+        this.buildUnsent = true;
+        return true;
+    }
+
+    /**
+     * Suspends the stages kept built under this activity (see {@link ActivityInstance.keepUnderWizard}). Called when this
+     * activity is dropped without finishing its wizard, so nothing will return to them.
+     */
+    suspendKeptSources(): void {
+        let source = this.sourceActivity;
+        while (source?.keptUnderWizard) {
+            source.suspend();
+            source = source.sourceActivity;
+        }
     }
 
     /**
@@ -246,10 +288,11 @@ export class ActivityInstance {
     /**
      * Marks the activity awake, calls `afterWake()` outside the app lock, and loads its pop-up if it has one. An activity
      * with no current build (just opened, popped or replaced, or suspended since) is loaded instead: built, sent to the
-     * client and then woken by {@link ActivityInstance.load}.
+     * client and then woken by {@link ActivityInstance.load}. So is a stage that was kept built under a wizard: its build
+     * exists but the client has to get it again.
      */
     async wake(): Promise<AppResult> {
-        if (this.status < ActivityStatus.Rendered) {
+        if (this.status < ActivityStatus.Rendered || this.buildUnsent) {
             return await this.load();
         }
         this.status = ActivityStatus.Waked;
@@ -397,10 +440,13 @@ export class ActivityInstance {
         }
     }
 
-    /** Wizard `$pop`: runs the wizard as a pop-up of this activity. */
+    /**
+     * Wizard `$pop`: runs the wizard as a pop-up of this activity. A wizard stage that pops another wizard (a form field
+     * that opens a selection table) stays built under it, so it is not rendered again, and reset, when that wizard finishes.
+     */
     protected async handleWizardPop(actor: WizardPop): Promise<AppResult> {
         const instance = new StageInstance(actor.mainStage, actor.ctx, actor.on);
-        return await this.driver.pop(instance);
+        return await this.driver.pop(instance, this instanceof StageInstance);
     }
 
     /** `$detached`: runs the wizard in a new activity. */

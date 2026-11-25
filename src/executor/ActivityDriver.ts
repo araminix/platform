@@ -190,8 +190,10 @@ export class ActivityDriver {
      * Shows `activity` as a pop-up whose source is this activity (used by `$pop`).
      *
      * @param activity - The pop-up activity.
+     * @param keepSource - Keep this activity built under the pop-up instead of suspending it (see
+     * {@link ActivityInstance.keepUnderWizard}); used when a wizard stage pops another wizard.
      */
-    async pop(activity: ActivityInstance): Promise<AppResult> {
+    async pop(activity: ActivityInstance, keepSource: boolean = false): Promise<AppResult> {
         const result = await this.executeIfActive(async () => {
             if (!activity.driver) {
                 activity.init(new ActivityDriver(this.appInstance, activity), undefined, this.activity, true);
@@ -199,6 +201,8 @@ export class ActivityDriver {
             const parent = this.appInstance.getParentActivity(this.id);
             if (parent) {
                 parent.setPop(activity);
+            } else if (keepSource && this.activity.keepUnderWizard()) {
+                await this.appInstance.replace(this.id, activity, false);
             } else {
                 await this.appInstance.replace(this.id, activity);
             }

@@ -50,6 +50,26 @@ function page(title: string, beforeRender: (ctx: any, template: any) => Actor = 
     return template;
 }
 
+// A page (or stage) that counts how often it renders.
+function countedPage(title: string, renders: Record<string, number>): any {
+    const template: any = {
+        _init: () =>
+            new ActivityInterface(
+                template,
+                () => new Nothing(),
+                () => undefined,
+                () => undefined,
+                async () => {
+                    renders[title] = (renders[title] ?? 0) + 1;
+                    panel(() => undefined);
+                },
+                () => title,
+                () => undefined,
+            ),
+    };
+    return template;
+}
+
 async function startedApp(main: any): Promise<AppInstance> {
     const app = new AppInstance({ main } as any, 12);
     await app.init();
@@ -202,6 +222,78 @@ describe('activity loading', () => {
         assert.strictEqual(app.activeId, mainId);
         assert.strictEqual(builds.at(-1)?.data.activityId, mainId);
         assert.strictEqual(builds.at(-1)?.data.isPop, false);
+    });
+
+    it('keeps a wizard stage built while a wizard it popped is shown, and sends the same build when that wizard finishes', async () => {
+        const renders: Record<string, number> = {};
+        const app = await startedApp(page('main'));
+        await active(app).handleActor(new WizardPop(countedPage('form', renders) as never, undefined, () => new Nothing()));
+        const form = active(app);
+        const formId = app.activeId;
+        const formBuild = builds.at(-1)?.data.build;
+
+        // The form's field opens a selection table: a wizard popped by a wizard stage.
+        let received: unknown;
+        await form.handleActor(
+            new WizardPop(countedPage('table', renders) as never, undefined, (result: unknown) => {
+                received = result;
+                return new Nothing();
+            }),
+        );
+        assert.strictEqual(active(app).title, 'table');
+        builds = [];
+
+        const result = await active(app).driver.wizardDone(new Ok('row-1'));
+
+        assert.ok(result.isOk());
+        assert.ok(received, 'the handler of the popped wizard got its result');
+        assert.strictEqual(active(app), form, 'the form stage is active again');
+        assert.strictEqual(renders.form, 1, 'the form stage was not rendered again, so its fragments kept their state');
+        assert.strictEqual(builds.length, 1);
+        assert.strictEqual(builds[0].data.activityId, formId);
+        assert.strictEqual(builds[0].data.isPop, true);
+        assert.deepStrictEqual(builds[0].data.build, formBuild, 'the client gets the same build again');
+    });
+
+    it('keeps the wizard stage built when the popped wizard is cancelled', async () => {
+        const renders: Record<string, number> = {};
+        const app = await startedApp(page('main'));
+        await active(app).handleActor(new WizardPop(countedPage('form', renders) as never, undefined, () => new Nothing()));
+        const form = active(app);
+        await form.handleActor(new WizardPop(countedPage('table', renders) as never, undefined, () => new Nothing()));
+        builds = [];
+
+        const result = await app.prev(app.activeId);
+
+        assert.ok(result.isOk());
+        assert.strictEqual(active(app), form);
+        assert.strictEqual(renders.form, 1);
+        assert.strictEqual(builds.length, 1, 'the form build is sent again');
+    });
+
+    it('still renders a page again when a wizard it popped finishes', async () => {
+        const renders: Record<string, number> = {};
+        const app = await startedApp(countedPage('main', renders));
+        await active(app).handleActor(new WizardPop(page('stage') as never, undefined, () => new Nothing()));
+
+        await active(app).driver.wizardDone(new Ok('done'));
+
+        assert.strictEqual(active(app).title, 'main');
+        assert.strictEqual(renders.main, 2, 'a page shows fresh content after a wizard');
+    });
+
+    it('suspends a stage kept under a wizard when that wizard is closed without finishing', async () => {
+        const renders: Record<string, number> = {};
+        const app = await startedApp(page('main'));
+        await active(app).handleActor(new OpenPage(page('second'), undefined));
+        await active(app).handleActor(new WizardPop(countedPage('form', renders) as never, undefined, () => new Nothing()));
+        const form = active(app);
+        await form.handleActor(new WizardPop(countedPage('table', renders) as never, undefined, () => new Nothing()));
+        assert.ok(form.status >= 2, 'the form stage is still built under the table');
+
+        await app.close(app.activeId);
+
+        assert.ok(form.status < 2, 'nothing returns to the form stage, so it is suspended');
     });
 
     it('builds once when beforeRender() refreshes the page with a default context', async () => {
